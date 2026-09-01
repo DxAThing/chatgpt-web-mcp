@@ -63,6 +63,12 @@ export function parseAnswerTier(valueText) {
   return text ? text.split(/[,，]/, 1)[0]?.trim() || null : null;
 }
 
+export function interruptedGenerationFields(runtime, interruptedAt = Date.now()) {
+  return runtime?.activeGeneration?.active
+    ? { activeGeneration: null, lastGenerationInterruptedAt: interruptedAt }
+    : { activeGeneration: null };
+}
+
 function matchesConfiguredPattern(text, pattern) {
   try {
     return new RegExp(pattern, "iu").test(text);
@@ -1164,7 +1170,11 @@ export class ChatGPTBrowser {
           }
         : null;
     await this.close({ terminateBrowser: true });
-    await updateRuntimeState({ authenticatedUntil: 0, proProbe: reliableProbe });
+    await updateRuntimeState({
+      authenticatedUntil: 0,
+      proProbe: reliableProbe,
+      ...interruptedGenerationFields(runtime, closedAt),
+    });
     return {
       closed: true,
       pid: state?.pid || null,
@@ -2386,6 +2396,85 @@ export class ChatGPTBrowser {
     return { written: true, characters: value.length, preview: value.slice(0, 300) };
   }
 
+  async webSearchState() {
+    const composer = await this.composer();
+    const hint = composer.locator(SELECTORS.webSearchHints.join(", ")).first();
+    const selected =
+      (await hint.count()) > 0 && (await hint.isVisible().catch(() => false));
+    return {
+      selected,
+      label: selected
+        ? (await hint.innerText().catch(() => "")).replace(/\s+/g, " ").trim() || null
+        : null,
+    };
+  }
+
+  async enableWebSearch() {
+    await this.ensureSignedIn();
+    const current = await this.webSearchState();
+    if (current.selected) return { ...current, changed: false };
+
+    const page = await this.page();
+    const menuButton = await this.firstVisible(SELECTORS.attachmentButton, { timeout: 1_500 });
+    if (!menuButton) {
+      throw new ChatGPTWebError("没有找到 ChatGPT 输入框的能力菜单。", {
+        url: page.url(),
+      });
+    }
+    await this.click(menuButton, "open-composer-menu-for-web-search");
+    await page.waitForTimeout(250);
+
+    let item = null;
+    for (const label of ["Web search", "网页搜索"]) {
+      // The page can already contain a Web search pill in an older assistant
+      // message.  Selecting the first text match therefore clicks stale
+      // content instead of the newly opened composer menu.  Current ChatGPT
+      // menu entries expose `data-fill` and `tabindex=0`; prefer those and
+      // keep role/class fallbacks for older layouts.
+      const selectors = [
+        "[data-fill][tabindex='0']",
+        ".group.__menu-item[tabindex='0']",
+        "[role='menuitem'], [role='menuitemradio'], [role='option']",
+      ];
+      for (const selector of selectors) {
+        const matches = page.locator(selector).filter({ hasText: label });
+        for (let index = 0; index < (await matches.count()); index += 1) {
+          const candidate = matches.nth(index);
+          if (!(await candidate.isVisible().catch(() => false))) continue;
+          const isComposerPill = await candidate
+            .evaluate((element) => Boolean(element.closest("[contenteditable='true']")))
+            .catch(() => false);
+          if (isComposerPill) continue;
+          item = candidate;
+          break;
+        }
+        if (item) break;
+      }
+      if (item) break;
+    }
+    if (!item) {
+      await this.keyboardPress(page, "Escape", "close-composer-menu").catch(() => {});
+      throw new ChatGPTWebError(
+        "当前账号、工作区或页面版本没有显示“网页搜索”能力。",
+        { url: page.url() },
+      );
+    }
+
+    const interactive = item.locator(
+      "xpath=ancestor-or-self::*[self::button or @role='button' or @role='menuitem' or @role='menuitemradio' or @tabindex][1]",
+    );
+    await this.domClick((await interactive.count()) > 0 ? interactive : item, "enable-web-search");
+    await page.waitForTimeout(250);
+
+    const verified = await this.webSearchState();
+    if (!verified.selected) {
+      throw new ChatGPTWebError("已点击“网页搜索”，但输入框未出现选中标记。", {
+        url: page.url(),
+      });
+    }
+    return { ...verified, changed: true };
+  }
+
   async validateFiles(files) {
     if (!files?.length) return [];
     const result = [];
@@ -2702,6 +2791,7 @@ export class ChatGPTBrowser {
   async sendMessage({
     prompt,
     files = [],
+    webSearch = false,
     model,
     mode,
     thinkingLevel,
@@ -2724,11 +2814,13 @@ export class ChatGPTBrowser {
     }
     if (files.length) await this.uploadFiles(files);
     await this.writePrompt(prompt);
+    const search = webSearch ? await this.enableWebSearch() : { selected: false };
     const effectiveTimeoutMs =
       isProModel(model) || isProTier(answerTier) || isProTier(this.#answerTier)
         ? null
         : timeoutMs;
-    return this.submitPrompt({ wait, timeoutMs: effectiveTimeoutMs });
+    const result = await this.submitPrompt({ wait, timeoutMs: effectiveTimeoutMs });
+    return { ...result, webSearch: search };
   }
 
   async probeProIdentity({ mode, force = false } = {}) {
@@ -2817,6 +2909,7 @@ export class ChatGPTBrowser {
   async routeNewChat({
     prompt,
     files = [],
+    webSearch = false,
     requestPro = false,
     forceProbe = false,
     mode,
@@ -2828,13 +2921,14 @@ export class ChatGPTBrowser {
       const tier = await this.selectExtremeTier(DEFAULT_ANSWER_TIER);
       if (files.length) await this.uploadFiles(files);
       await this.writePrompt(prompt);
+      const search = webSearch ? await this.enableWebSearch() : { selected: false };
       const result = await this.submitPrompt({ wait, timeoutMs });
       return {
         route: "default-extreme",
         probe: null,
         finalConversation: { tier: DEFAULT_ANSWER_TIER, temporary: false },
         tier,
-        result,
+        result: { ...result, webSearch: search },
       };
     }
 
@@ -2865,6 +2959,7 @@ export class ChatGPTBrowser {
     }
     if (files.length) await this.uploadFiles(files);
     await this.writePrompt(prompt);
+    const search = webSearch ? await this.enableWebSearch() : { selected: false };
     const result = await this.submitPrompt({
       wait,
       timeoutMs: classification === PROBE_ACCEPT_CLASSIFICATION ? null : timeoutMs,
@@ -2892,7 +2987,7 @@ export class ChatGPTBrowser {
         temporary: false,
       },
       tier: finalTier,
-      result,
+      result: { ...result, webSearch: search },
     };
   }
 

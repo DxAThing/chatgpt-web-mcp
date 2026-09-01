@@ -194,6 +194,13 @@ tool(
 );
 
 tool(
+  "chatgpt_enable_web_search",
+  "在当前输入框中启用 ChatGPT 网页原生“网页搜索”，并校验选中标记。应在写入提示词和上传文件后、发送前调用。",
+  {},
+  () => browser.enableWebSearch(),
+);
+
+tool(
   "chatgpt_upload_files",
   "向当前 ChatGPT 对话上传用户明确授权的本地文件。路径必须是绝对路径。不会自动发送提示词。",
   {
@@ -218,6 +225,7 @@ tool(
   {
     prompt: z.string().min(1),
     files: z.array(z.string().min(1)).default([]),
+    webSearch: z.boolean().default(false).describe("发送前启用并校验 ChatGPT 网页原生网页搜索。"),
     mode: z.string().min(1).optional(),
     model: z.string().min(1).optional(),
     thinkingLevel: z.string().min(1).optional(),
@@ -246,6 +254,7 @@ tool(
   {
     prompt: z.string().min(1).describe("最终正常对话要发送的实际提示词。"),
     files: z.array(z.string().min(1)).default([]),
+    webSearch: z.boolean().default(false).describe("发送前启用并校验 ChatGPT 网页原生网页搜索。"),
     requestPro: z.boolean().default(false).describe("用户是否明确要求 Pro。"),
     forceProbe: z.boolean().default(false).describe("是否忽略会话级 Pro 探针缓存；仅在用户明确要求时设为 true。"),
     mode: z.string().min(1).optional(),

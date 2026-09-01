@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   classifyProbeModel,
   classifyRateLimitText,
+  interruptedGenerationFields,
   isProModel,
   isProTier,
   networkRateLimitScope,
@@ -310,4 +311,20 @@ test("siteActionWaitMs honors an absolute history quiet deadline", () => {
     ),
     140_000,
   );
+});
+
+test("closing the browser releases an interrupted generation lock", () => {
+  assert.deepEqual(
+    interruptedGenerationFields(
+      { activeGeneration: { active: true, status: "waiting" } },
+      123_456,
+    ),
+    {
+      activeGeneration: null,
+      lastGenerationInterruptedAt: 123_456,
+    },
+  );
+  assert.deepEqual(interruptedGenerationFields({}, 123_456), {
+    activeGeneration: null,
+  });
 });

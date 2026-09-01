@@ -41,6 +41,10 @@ export const SELECTORS = {
     "button[aria-label*='添加']",
     "button[aria-label*='上传']",
   ],
+  webSearchHints: [
+    "[data-inline-selection-pill][data-id='search']",
+    "[data-system-hint-type='search']",
+  ],
   uploadMenuItems: [
     "[role='menuitem']:has-text('Add photos & files')",
     "[role='menuitem']:has-text('Upload from computer')",
