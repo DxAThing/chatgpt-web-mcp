@@ -2,12 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  classifyNetworkModelSlug,
   classifyProbeModel,
   classifyRateLimitText,
   interruptedGenerationFields,
   isProModel,
   isProTier,
   networkRateLimitScope,
+  normalizeModelSlug,
   parseAdvancedRowValue,
   parseAnswerTier,
   rankTextMatch,
@@ -76,6 +78,30 @@ test("classifyProbeModel only accepts the two explicit routing identities", () =
   );
 });
 
+test("network model_slug is authoritative for identity verification", () => {
+  assert.equal(normalizeModelSlug("GPT_5.6-thinking"), "gpt-5-6-thinking");
+  assert.equal(classifyNetworkModelSlug("gpt-5-5-mini"), "gpt-5.5-mini");
+  assert.equal(classifyNetworkModelSlug("gpt-5-6-thinking"), "network-verified");
+  assert.equal(
+    classifyProbeModel("我是 GPT-5.6 Sol。", {
+      networkModelSlug: "gpt-5-6-thinking",
+      requireNetworkModelSlug: true,
+    }),
+    "network-verified",
+  );
+  assert.equal(
+    classifyProbeModel("我是 GPT-5.6 Sol。", {
+      networkModelSlug: "gpt-5-5-mini",
+      requireNetworkModelSlug: true,
+    }),
+    "gpt-5.5-mini",
+  );
+  assert.equal(
+    classifyProbeModel("我是 GPT-5.6 Pro。", { requireNetworkModelSlug: true }),
+    "unknown",
+  );
+});
+
 test("chromeExecutableCandidates supports explicit and platform-specific paths", () => {
   assert.deepEqual(
     chromeExecutableCandidates({
@@ -115,7 +141,9 @@ test("siteActionDelayMs enforces the configured start interval", () => {
 
 test("validProbeCache stays valid for the same open browser page session", () => {
   const cache = {
-    classification: "gpt-5.6-pro",
+    classification: "network-verified",
+    modelSlug: "gpt-5-6-thinking",
+    modelSlugSource: "conversation-response",
     policyKey: PROBE_POLICY_KEY,
     mode: "聊天",
     checkedAt: 5_000,
@@ -149,11 +177,20 @@ test("validProbeCache stays valid for the same open browser page session", () =>
     ),
     null,
   );
+  assert.equal(
+    validProbeCache(
+      { ...cache, modelSlug: null, modelSlugSource: null },
+      { mode: "聊天", session },
+    ),
+    null,
+  );
 });
 
 test("validProbeCache waits three hours after a page or browser interruption", () => {
   const cache = {
-    classification: "gpt-5.6-pro",
+    classification: "network-verified",
+    modelSlug: "gpt-5-6-thinking",
+    modelSlugSource: "conversation-response",
     policyKey: PROBE_POLICY_KEY,
     mode: "聊天",
     checkedAt: 5_000,
@@ -205,7 +242,9 @@ test("validProbeCache waits three hours after a page or browser interruption", (
 
 test("validProbeCache migrates a legacy cache when its original browser is still open", () => {
   const cache = {
-    classification: "gpt-5.6-pro",
+    classification: "network-verified",
+    modelSlug: "gpt-5-6-thinking",
+    modelSlugSource: "conversation-response",
     policyKey: PROBE_POLICY_KEY,
     mode: "聊天",
     checkedAt: 5_000,

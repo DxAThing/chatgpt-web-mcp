@@ -25,6 +25,7 @@ import {
   PROBE_ACCEPT_PATTERN,
   PROBE_FALLBACK_CLASSIFICATION,
   PROBE_FALLBACK_PATTERN,
+  PROBE_NETWORK_ACCEPT_CLASSIFICATION,
   PROBE_POLICY_KEY,
   PROBE_PROMPT,
   PRO_ANSWER_TIER,
@@ -63,6 +64,27 @@ export function parseAnswerTier(valueText) {
   return text ? text.split(/[,，]/, 1)[0]?.trim() || null : null;
 }
 
+export function normalizeModelSlug(value) {
+  return String(value || "")
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[_\s.]+/g, "-")
+    .replace(/-+/g, "-");
+}
+
+export function classifyNetworkModelSlug(
+  modelSlug,
+  {
+    fallbackClassification = PROBE_FALLBACK_CLASSIFICATION,
+    acceptClassification = PROBE_NETWORK_ACCEPT_CLASSIFICATION,
+  } = {},
+) {
+  const normalized = normalizeModelSlug(modelSlug);
+  if (!normalized) return null;
+  if (/^gpt-5-5-mini(?:-|$)/u.test(normalized)) return fallbackClassification;
+  return acceptClassification;
+}
+
 export function interruptedGenerationFields(runtime, interruptedAt = Date.now()) {
   return runtime?.activeGeneration?.active
     ? { activeGeneration: null, lastGenerationInterruptedAt: interruptedAt }
@@ -87,8 +109,19 @@ export function classifyProbeModel(
     fallbackPattern = PROBE_FALLBACK_PATTERN,
     acceptClassification = PROBE_ACCEPT_CLASSIFICATION,
     fallbackClassification = PROBE_FALLBACK_CLASSIFICATION,
+    networkAcceptClassification = PROBE_NETWORK_ACCEPT_CLASSIFICATION,
+    networkModelSlug = null,
+    requireNetworkModelSlug = false,
   } = {},
 ) {
+  if (networkModelSlug != null) {
+    const networkClassification = classifyNetworkModelSlug(networkModelSlug, {
+      acceptClassification: networkAcceptClassification,
+      fallbackClassification,
+    });
+    if (networkClassification) return networkClassification;
+  }
+  if (requireNetworkModelSlug) return "unknown";
   const text = String(response || "");
   if (matchesConfiguredPattern(text, acceptPattern)) return acceptClassification;
   if (matchesConfiguredPattern(text, fallbackPattern)) return fallbackClassification;
@@ -221,8 +254,18 @@ export function validProbeCache(
 ) {
   if (!value) return null;
   if (value.policyKey !== PROBE_POLICY_KEY) return null;
+  if (value.modelSlugSource !== "conversation-response" || !value.modelSlug) {
+    return null;
+  }
+  if (classifyNetworkModelSlug(value.modelSlug) !== value.classification) {
+    return null;
+  }
   if (
-    ![PROBE_ACCEPT_CLASSIFICATION, PROBE_FALLBACK_CLASSIFICATION].includes(
+    ![
+      PROBE_ACCEPT_CLASSIFICATION,
+      PROBE_FALLBACK_CLASSIFICATION,
+      PROBE_NETWORK_ACCEPT_CLASSIFICATION,
+    ].includes(
       value.classification,
     )
   ) {
@@ -752,6 +795,43 @@ export class ChatGPTBrowser {
   #requestSignal = null;
   #networkLoggingPages = new WeakSet();
 
+  async captureConversationModelSlug(operation) {
+    const page = await this.page();
+    const modelSlugs = [];
+    const bodyReads = [];
+    const onResponse = (response) => {
+      let pathname;
+      try {
+        pathname = new URL(response.url()).pathname;
+      } catch {
+        return;
+      }
+      if (!/^\/backend-api\/(?:f\/)?conversation(?:\/|$)/iu.test(pathname)) return;
+      const read = response
+        .body()
+        .then((body) => {
+          const text = body.toString("utf8");
+          for (const match of text.matchAll(/"model_slug"\s*:\s*"([^"]+)"/gu)) {
+            if (match[1]) modelSlugs.push(match[1]);
+          }
+        })
+        .catch(() => {});
+      bodyReads.push(read);
+    };
+    page.on("response", onResponse);
+    try {
+      const result = await operation();
+      await Promise.allSettled(bodyReads);
+      return {
+        result,
+        modelSlug: modelSlugs.at(-1) || null,
+        modelSlugs: [...new Set(modelSlugs)],
+      };
+    } finally {
+      page.off("response", onResponse);
+    }
+  }
+
   async close({ terminateBrowser = false } = {}) {
     const chromeProcess = this.#chromeProcess;
     if (this.#browser) {
@@ -1159,7 +1239,11 @@ export class ChatGPTBrowser {
     const closedAt = Date.now();
     const reliableProbe =
       runtime.proProbe?.policyKey === PROBE_POLICY_KEY &&
-      [PROBE_ACCEPT_CLASSIFICATION, PROBE_FALLBACK_CLASSIFICATION].includes(
+      [
+        PROBE_ACCEPT_CLASSIFICATION,
+        PROBE_FALLBACK_CLASSIFICATION,
+        PROBE_NETWORK_ACCEPT_CLASSIFICATION,
+      ].includes(
         runtime.proProbe?.classification,
       )
         ? {
@@ -2834,10 +2918,11 @@ export class ChatGPTBrowser {
         }
         return {
           prompt: PROBE_PROMPT,
-          response: cached.response,
+          modelSlug: cached.modelSlug || null,
+          modelSlugSource: cached.modelSlug ? "conversation-response" : null,
           classification: cached.classification,
           temporary: true,
-          answerTier: PRO_ANSWER_TIER,
+          answerTier: cached.answerTier || null,
           url: cached.url || null,
           waitPolicy: "cached-probe",
           cachePolicy: cached.sessionInterruptedAt
@@ -2853,16 +2938,26 @@ export class ChatGPTBrowser {
       }
     }
 
-    await this.newChat(
-      { temporary: true, mode, answerTier: PRO_ANSWER_TIER },
-      { includeStatus: false },
-    );
+    // The visible Pro tier may be unavailable even when the backend serves a
+    // valid non-mini model. Identity is determined by model_slug, so probe the
+    // temporary chat at the currently available tier instead of failing early
+    // while trying to select an unavailable UI option.
+    await this.newChat({ temporary: true, mode }, { includeStatus: false });
     await this.writePrompt(PROBE_PROMPT);
-    const result = await this.submitPrompt({ wait: true, timeoutMs: null });
+    const captured = await this.captureConversationModelSlug(() =>
+      this.submitPrompt({ wait: true, timeoutMs: null }),
+    );
+    const result = captured.result;
+    const modelSlug = captured.modelSlug;
     const probe = {
       prompt: PROBE_PROMPT,
-      response: result.response,
-      classification: classifyProbeModel(result.response),
+      modelSlug,
+      modelSlugSource: modelSlug ? "conversation-response" : null,
+      modelSlugs: captured.modelSlugs,
+      classification: classifyProbeModel(result.response, {
+        networkModelSlug: modelSlug,
+        requireNetworkModelSlug: true,
+      }),
       temporary: result.temporary,
       answerTier: result.answerTier,
       url: result.url,
@@ -2877,8 +2972,10 @@ export class ChatGPTBrowser {
       const continuousPageSession =
         session.browserRunning && session.chatgptPageOpen;
       const cachedProbe = {
-        response: probe.response,
+        modelSlug: probe.modelSlug,
+        modelSlugSource: probe.modelSlugSource,
         classification: probe.classification,
+        answerTier: probe.answerTier || null,
         policyKey: PROBE_POLICY_KEY,
         mode: mode || null,
         url: probe.url,
@@ -2939,9 +3036,11 @@ export class ChatGPTBrowser {
       throw new ChatGPTWebError(
         "Pro 临时探针的回答不符合已配置的接受或回退规则；未创建正常对话。",
         {
-          probeResponse: probe.response,
+          modelSlug: probe.modelSlug,
+          modelSlugSource: probe.modelSlugSource,
           acceptedClassification: PROBE_ACCEPT_CLASSIFICATION,
           fallbackClassification: PROBE_FALLBACK_CLASSIFICATION,
+          networkAcceptedClassification: PROBE_NETWORK_ACCEPT_CLASSIFICATION,
           temporary: true,
         },
       );
@@ -2950,9 +3049,13 @@ export class ChatGPTBrowser {
     await this.newChat({ temporary: false, mode }, { includeStatus: false });
     let finalTier;
     let route;
+    const networkVerified = classification === PROBE_NETWORK_ACCEPT_CLASSIFICATION;
     if (classification === PROBE_ACCEPT_CLASSIFICATION) {
       finalTier = await this.selectAnswerTier(PRO_ANSWER_TIER);
       route = `verified-${classification}`;
+    } else if (networkVerified) {
+      finalTier = await this.selectExtremeTier(DEFAULT_ANSWER_TIER);
+      route = `verified-${classification}-to-default`;
     } else {
       finalTier = await this.selectExtremeTier(DEFAULT_ANSWER_TIER);
       route = `fallback-${classification}-to-default`;
@@ -2968,7 +3071,8 @@ export class ChatGPTBrowser {
       route,
       probe: {
         prompt: probe.prompt,
-        response: probe.response,
+        modelSlug: probe.modelSlug,
+        modelSlugSource: probe.modelSlugSource,
         classification,
         temporary: probe.temporary,
         cached: probe.cached,

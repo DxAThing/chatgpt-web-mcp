@@ -9,6 +9,7 @@ import {
   DEFAULT_ANSWER_TIER,
   PROBE_ACCEPT_CLASSIFICATION,
   PROBE_FALLBACK_CLASSIFICATION,
+  PROBE_NETWORK_ACCEPT_CLASSIFICATION,
   PROBE_PROMPT,
   PRO_ANSWER_TIER,
   PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
@@ -22,7 +23,7 @@ const server = new McpServer({
   version: "0.2.1",
 }, {
   instructions:
-    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。新任务优先用 chatgpt_route_new_chat：普通请求使用配置的默认档位“${DEFAULT_ANSWER_TIER}”；用户明确要求 Pro 时，临时使用“${PRO_ANSWER_TIER}”并发送身份探针，接受分类为“${PROBE_ACCEPT_CLASSIFICATION}”，回退分类为“${PROBE_FALLBACK_CLASSIFICATION}”。同一浏览器和 ChatGPT 页面会话内始终复用可靠探针；页面或浏览器关闭后保留结果 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。只有用户明确要求重新验证时才设置 forceProbe。`,
+    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。新任务优先用 chatgpt_route_new_chat：普通请求使用当前可用档位“${DEFAULT_ANSWER_TIER}”；需要模型身份确认时发送网络身份探针，不选择或依赖当前不可用的 Pro 档位。身份以已完成的 /backend-api/f/conversation 响应中的 model_slug 为唯一权威：规范化后精确为 gpt-5-5-mini 才回退，任何其他非空 slug（例如 gpt-5-6-thinking）分类为“${PROBE_NETWORK_ACCEPT_CLASSIFICATION}”；页面自报文本不保留、不参与校验。页面或浏览器关闭后保留可靠结果 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。只有用户明确要求重新验证时才设置 forceProbe。`,
 });
 
 function asResult(value, isError = false) {
@@ -153,9 +154,9 @@ tool(
 
 tool(
   "chatgpt_select_answer_tier",
-  `选择输入框右侧的能力档位。当前支持精确选择配置的最高档“${PRO_ANSWER_TIER}”，并校验页面显示结果。`,
+  `选择输入框右侧当前可用的能力档位，并校验页面显示结果；不假设 Pro 档位存在。`,
   {
-    answerTier: z.string().min(1).describe(`能力档位名称；最高档默认为“${PRO_ANSWER_TIER}”。`),
+    answerTier: z.string().min(1).describe("页面当前可用的能力档位名称。"),
   },
   ({ answerTier }) => browser.selectAnswerTier(answerTier),
 );
@@ -168,7 +169,7 @@ tool(
     mode: z.string().min(1).optional().describe("可选模式，例如“聊天”或“工作”。"),
     model: z.string().min(1).optional().describe("可选模型名称。"),
     thinkingLevel: z.string().min(1).optional().describe("可选思考强度。"),
-    answerTier: z.string().min(1).optional().describe(`可选能力档位；传“${PRO_ANSWER_TIER}”时使用滑杆最后一档。`),
+    answerTier: z.string().min(1).optional().describe("可选能力档位；必须是页面当前可用值。"),
   },
   ({ temporary, mode, model, thinkingLevel, answerTier }) =>
     browser.newChat({ temporary, mode, model, thinkingLevel, answerTier }),
@@ -240,7 +241,7 @@ tool(
 
 tool(
   "chatgpt_probe_pro_identity",
-  `执行 Pro 身份探针：同一浏览器和 ChatGPT 页面会话内始终复用同模式的可靠结果；页面或浏览器关闭后继续复用 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。没有可用缓存时才新建临时对话、切到“${PRO_ANSWER_TIER}”、发送“${PROBE_PROMPT}”并无限等待。返回原回答及配置的接受/回退/unknown 分类，不创建正常对话。`,
+  `执行网络模型身份探针（工具名保留旧名称以兼容调用）：同一浏览器和 ChatGPT 页面会话内始终复用可靠结果；页面或浏览器关闭后继续复用 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。没有可用缓存时才新建临时对话，在当前可用能力档位发送“${PROBE_PROMPT}”并无限等待，不选择或依赖 Pro。返回 modelSlug、modelSlugSource 和分类，不保留页面自报文本；已完成 /backend-api/f/conversation 响应中的 model_slug 是唯一权威，gpt-5-5-mini 回退，其他非空 slug（例如 gpt-5-6-thinking）通过网络身份校验；缺少 model_slug 为 unknown。不创建正常对话。`,
   {
     mode: z.string().min(1).optional(),
     force: z.boolean().default(false).describe("true 表示忽略缓存并重新执行探针；仅在用户明确要求时使用。"),
@@ -250,7 +251,7 @@ tool(
 
 tool(
   "chatgpt_route_new_chat",
-  `按可配置策略新建并发送：普通请求使用“${DEFAULT_ANSWER_TIER}”；明确请求 Pro 时先执行临时身份探针，命中“${PROBE_ACCEPT_CLASSIFICATION}”才在正常对话继续使用“${PRO_ANSWER_TIER}”，命中“${PROBE_FALLBACK_CLASSIFICATION}”则回退默认档位，其他回答停止。浏览器始终常驻。`,
+  `按可配置策略新建并发送：普通请求使用当前可用档位“${DEFAULT_ANSWER_TIER}”；需要身份确认时先执行网络模型身份探针，不选择或依赖 Pro。网络 model_slug 命中 gpt-5-5-mini 则回退默认档位；其他非空 slug（分类“${PROBE_NETWORK_ACCEPT_CLASSIFICATION}”）通过身份校验并使用默认可用档位；缺少或未知身份停止。浏览器始终常驻。`,
   {
     prompt: z.string().min(1).describe("最终正常对话要发送的实际提示词。"),
     files: z.array(z.string().min(1)).default([]),
