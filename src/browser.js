@@ -2693,6 +2693,9 @@ export class ChatGPTBrowser {
     if (!normalize(promptText)) throw new ChatGPTWebError("输入框为空，无法发送。");
 
     const assistantBefore = await this.assistantLocator().count();
+    const assistantBeforeText = assistantBefore
+      ? await this.assistantLocator().last().innerText().catch(() => "")
+      : "";
     const userBefore = await this.userLocator().count();
     await this.siteAction("send-prompt");
     const send = await this.firstVisible(SELECTORS.sendButton, { timeout: 1_000 });
@@ -2739,6 +2742,7 @@ export class ChatGPTBrowser {
     try {
       const result = await this.waitForResponse({
         assistantBefore,
+        baselineResponse: assistantBeforeText,
         timeoutMs: effectiveTimeoutMs,
       });
       await updateRuntimeState({ activeGeneration: null, lastGenerationCompletedAt: Date.now() });
@@ -2760,7 +2764,11 @@ export class ChatGPTBrowser {
     }
   }
 
-  async waitForResponse({ assistantBefore, timeoutMs = RESPONSE_TIMEOUT_MS } = {}) {
+  async waitForResponse({
+    assistantBefore,
+    baselineResponse = "",
+    timeoutMs = RESPONSE_TIMEOUT_MS,
+  } = {}) {
     const page = await this.page();
     const signal = this.signal();
     throwIfAborted(signal);
@@ -2768,7 +2776,7 @@ export class ChatGPTBrowser {
       assistantBefore ?? Math.max(0, (await this.assistantLocator().count()) - 1);
     const unlimited = timeoutMs == null;
     const observerPromise = page.evaluate(
-      ({ assistantSelectors, stopSelectors, baselineCount, timeout }) =>
+      ({ assistantSelectors, stopSelectors, baselineCount, baselineResponse, timeout }) =>
         new Promise((resolve) => {
           const visible = (element) => {
             if (!(element instanceof HTMLElement)) return false;
@@ -2817,8 +2825,11 @@ export class ChatGPTBrowser {
               stableSince = Date.now();
             }
             clearTimeout(stableTimer);
+            const hasNewResponse =
+              state.count > baselineCount ||
+              (Boolean(state.response) && state.response !== baselineResponse);
             if (
-              state.count > baselineCount &&
+              hasNewResponse &&
               state.response &&
               !state.stop &&
               !state.streaming
@@ -2826,8 +2837,11 @@ export class ChatGPTBrowser {
               const remaining = Math.max(0, 2_000 - (Date.now() - stableSince));
               stableTimer = setTimeout(() => {
                 const verified = read();
+                const verifiedHasNewResponse =
+                  verified.count > baselineCount ||
+                  (Boolean(verified.response) && verified.response !== baselineResponse);
                 if (
-                  verified.count > baselineCount &&
+                  verifiedHasNewResponse &&
                   verified.response === stableText &&
                   !verified.stop &&
                   !verified.streaming
@@ -2864,6 +2878,7 @@ export class ChatGPTBrowser {
         assistantSelectors: SELECTORS.assistantMessages.join(", "),
         stopSelectors: SELECTORS.stopButton.join(", "),
         baselineCount: baseline,
+        baselineResponse,
         timeout: unlimited ? null : timeoutMs,
       },
     );
