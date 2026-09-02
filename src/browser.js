@@ -2714,6 +2714,7 @@ export class ChatGPTBrowser {
         url: page.url(),
         ownerPid: process.pid,
         assistantBefore,
+        baselineResponse: assistantBeforeText,
         status: wait ? "waiting" : "unobserved",
       },
     });
@@ -2756,9 +2757,22 @@ export class ChatGPTBrowser {
             url: page.url(),
             ownerPid: null,
             assistantBefore,
+            baselineResponse: assistantBeforeText,
             status: "client-cancelled-generation-may-continue",
           },
         });
+      } else {
+        // A client-side timeout must not leave a completed/non-generating page
+        // permanently locked. Keep the lock only while the page still shows
+        // an active generation; getLatestResponse can then clear it once the
+        // final text is observable.
+        const latest = await this.getLatestResponse().catch(() => null);
+        if (latest && !latest.generating) {
+          await updateRuntimeState({
+            activeGeneration: null,
+            lastGenerationInterruptedAt: Date.now(),
+          });
+        }
       }
       throw error;
     }
@@ -3342,12 +3356,14 @@ export class ChatGPTBrowser {
       : false;
     const generationComplete = Boolean(
       runtime.activeGeneration?.active &&
-        (runtime.activeGeneration.assistantBefore == null
-          ? count > 0
-          : count >= Number(runtime.activeGeneration.assistantBefore)) &&
         Boolean(lastAssistantText.trim()) &&
         !stop &&
-        !streaming,
+        !streaming &&
+        (runtime.activeGeneration.assistantBefore == null
+          ? count > 0
+          : count > Number(runtime.activeGeneration.assistantBefore) ||
+            lastAssistantText.trim() !==
+              String(runtime.activeGeneration.baselineResponse || "").trim()),
     );
     const staleGeneration = generationIsStale(runtime);
     if (generationComplete || staleGeneration) {
