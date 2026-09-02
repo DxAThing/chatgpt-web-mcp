@@ -3315,6 +3315,9 @@ export class ChatGPTBrowser {
     const runtime = await readRuntimeState();
     const stop = await this.firstVisible(SELECTORS.stopButton, { timeout: 100 });
     const lastAssistant = count ? assistant.last() : null;
+    const lastAssistantText = lastAssistant
+      ? await lastAssistant.innerText().catch(() => "")
+      : "";
     const streaming = lastAssistant
       ? await lastAssistant
           .locator("[data-is-streaming='true'], .result-streaming")
@@ -3326,7 +3329,8 @@ export class ChatGPTBrowser {
       runtime.activeGeneration?.active &&
         (runtime.activeGeneration.assistantBefore == null
           ? count > 0
-          : count > Number(runtime.activeGeneration.assistantBefore)) &&
+          : count >= Number(runtime.activeGeneration.assistantBefore)) &&
+        Boolean(lastAssistantText.trim()) &&
         !stop &&
         !streaming,
     );
