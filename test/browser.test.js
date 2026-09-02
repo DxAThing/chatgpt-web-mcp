@@ -5,6 +5,7 @@ import {
   classifyNetworkModelSlug,
   classifyProbeModel,
   classifyRateLimitText,
+  generationIsStale,
   interruptedGenerationFields,
   isProModel,
   isProTier,
@@ -366,4 +367,16 @@ test("closing the browser releases an interrupted generation lock", () => {
   assert.deepEqual(interruptedGenerationFields({}, 123_456), {
     activeGeneration: null,
   });
+});
+
+test("dead generation owners are stale but the current process is not", () => {
+  assert.equal(
+    generationIsStale({ activeGeneration: { active: true, ownerPid: 2_147_483_647 } }),
+    true,
+  );
+  assert.equal(
+    generationIsStale({ activeGeneration: { active: true, ownerPid: process.pid } }),
+    false,
+  );
+  assert.equal(generationIsStale({ activeGeneration: { active: true } }), false);
 });

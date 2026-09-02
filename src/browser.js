@@ -563,12 +563,15 @@ async function withRuntimeState(update, { signal } = {}) {
 }
 
 async function waitForSiteAction(action, signal) {
-  const initial = await readRuntimeState();
+  let initial = await readRuntimeState();
   if (initial.circuitBreaker?.active) {
     throw new ChatGPTWebError(
       "ChatGPT 安全熔断已开启。不会执行新的网页操作；请先人工确认限流提示已经消失。",
       { circuitBreaker: initial.circuitBreaker, action },
     );
+  }
+  if (generationIsStale(initial)) {
+    initial = await clearStaleActiveGeneration(initial);
   }
   if (initial.activeGeneration?.active) {
     throw new ChatGPTWebError(
@@ -597,6 +600,13 @@ async function waitForSiteAction(action, signal) {
         "等待期间 ChatGPT 安全熔断已开启，当前网页操作已取消。",
         { circuitBreaker: state.circuitBreaker, action },
       );
+    }
+    if (generationIsStale(state)) {
+      state = {
+        ...state,
+        activeGeneration: null,
+        lastGenerationInterruptedAt: Date.now(),
+      };
     }
     if (state.activeGeneration?.active) {
       throw new ChatGPTWebError(
@@ -712,6 +722,31 @@ function processIsAlive(pid) {
   } catch {
     return false;
   }
+}
+
+export function generationIsStale(runtime) {
+  const generation = runtime?.activeGeneration;
+  const ownerPid = Number(generation?.ownerPid || 0);
+  return Boolean(
+    generation?.active &&
+      ownerPid > 0 &&
+      ownerPid !== process.pid &&
+      !processIsAlive(ownerPid),
+  );
+}
+
+async function clearStaleActiveGeneration(runtime) {
+  if (!generationIsStale(runtime)) return runtime;
+  const interruptedAt = Date.now();
+  await updateRuntimeState({
+    activeGeneration: null,
+    lastGenerationInterruptedAt: interruptedAt,
+  });
+  return {
+    ...runtime,
+    activeGeneration: null,
+    lastGenerationInterruptedAt: interruptedAt,
+  };
 }
 
 async function acquireOperationLock(operation, signal) {
@@ -932,12 +967,16 @@ export class ChatGPTBrowser {
   }
 
   async assertActionsAllowed(action = "tool-call") {
-    const state = await readRuntimeState();
+    let state = await readRuntimeState();
     if (state.circuitBreaker?.active) {
       throw new ChatGPTWebError(
         "ChatGPT 安全熔断已开启。不会执行新的网页操作；请先人工确认限流提示已经消失。",
         { circuitBreaker: state.circuitBreaker, action },
       );
+    }
+    if (generationIsStale(state)) {
+      state = await clearStaleActiveGeneration(state);
+      return { allowed: true, staleGenerationCleared: true };
     }
     if (state.activeGeneration?.active) {
       throw new ChatGPTWebError(
@@ -3291,10 +3330,13 @@ export class ChatGPTBrowser {
         !stop &&
         !streaming,
     );
-    if (generationComplete) {
+    const staleGeneration = generationIsStale(runtime);
+    if (generationComplete || staleGeneration) {
       await updateRuntimeState({
         activeGeneration: null,
-        lastGenerationCompletedAt: Date.now(),
+        ...(generationComplete
+          ? { lastGenerationCompletedAt: Date.now() }
+          : { lastGenerationInterruptedAt: Date.now() }),
       });
     }
     const settings =
@@ -3311,7 +3353,8 @@ export class ChatGPTBrowser {
       response: count ? (await assistant.last().innerText()).trim() : null,
       assistantMessageCount: count,
       generating: Boolean(stop || streaming),
-      activeGeneration: generationComplete ? null : runtime.activeGeneration || null,
+      activeGeneration:
+        generationComplete || staleGeneration ? null : runtime.activeGeneration || null,
       rateLimited: rateLimit.limited,
       rateLimitScope: rateLimit.scope,
       circuitBreaker: rateLimit.limited
