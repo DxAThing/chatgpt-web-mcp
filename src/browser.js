@@ -2532,6 +2532,17 @@ export class ChatGPTBrowser {
     };
   }
 
+  async waitForWebSearchSelection({ timeoutMs = 2_000, pollMs = 50 } = {}) {
+    const page = await this.page();
+    const deadline = Date.now() + timeoutMs;
+    let state = await this.webSearchState();
+    while (!state.selected && Date.now() < deadline) {
+      await page.waitForTimeout(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+      state = await this.webSearchState();
+    }
+    return state;
+  }
+
   async enableWebSearch() {
     await this.ensureSignedIn();
     const current = await this.webSearchState();
@@ -2589,7 +2600,10 @@ export class ChatGPTBrowser {
     await this.domClick((await interactive.count()) > 0 ? interactive : item, "enable-web-search");
     await page.waitForTimeout(250);
 
-    const verified = await this.webSearchState();
+    // The composer inserts the inline selection pill asynchronously. A fixed
+    // 250 ms sleep races the UI on slower pages and reported a false failure
+    // even though the click had succeeded.
+    const verified = await this.waitForWebSearchSelection();
     if (!verified.selected) {
       throw new ChatGPTWebError("已点击“网页搜索”，但输入框未出现选中标记。", {
         url: page.url(),
