@@ -26,10 +26,12 @@ export const SELECTORS = {
   assistantMessages: [
     "[data-message-author-role='assistant']",
     "article[data-turn='assistant']",
+    "section[data-turn='assistant']",
   ],
   userMessages: [
     "[data-message-author-role='user']",
     "article[data-turn='user']",
+    "section[data-turn='user']",
   ],
   fileInput: [
     "input[type='file']",
