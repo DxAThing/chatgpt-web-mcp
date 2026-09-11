@@ -2228,6 +2228,61 @@ export class ChatGPTBrowser {
     await page.waitForTimeout(250);
   }
 
+  async directAdvancedSettings() {
+    const page = await this.page();
+    const picker = page
+      .locator("[data-testid='composer-intelligence-picker-content']:visible")
+      .last();
+    if (!(await picker.isVisible().catch(() => false))) return null;
+
+    const simpleView = picker
+      .locator("[data-testid='composer-model-picker-slider-simple-view']")
+      .last();
+    const advancedView = picker
+      .locator("[data-testid='composer-model-picker-slider-advanced-view']")
+      .last();
+    const toggle = picker
+      .locator(
+        "[role='menuitem'][aria-label='Select model'], [role='menuitem'][aria-label='选择模型']",
+      )
+      .last();
+    const slider = simpleView.locator("[role='slider']").last();
+    const checkedModel = advancedView
+      .locator("[role='menuitemradio'][aria-checked='true']")
+      .last();
+    if (
+      !(await simpleView.count()) ||
+      !(await advancedView.count()) ||
+      !(await toggle.count()) ||
+      !(await slider.count()) ||
+      !(await checkedModel.count())
+    ) {
+      return null;
+    }
+
+    const thinkingLevel = parseAnswerTier(await toggle.innerText().catch(() => ""));
+    const model = (await checkedModel.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+    if (!thinkingLevel || !model) return null;
+
+    return {
+      layout: "direct-picker",
+      picker,
+      slider,
+      modelRow: {
+        label: "Model",
+        locator: toggle,
+        text: `Model ${model}`,
+        value: model,
+      },
+      thinkingRow: {
+        label: "Thinking effort",
+        locator: slider,
+        text: `Thinking effort ${thinkingLevel}`,
+        value: thinkingLevel,
+      },
+    };
+  }
+
   async openAdvancedSettings() {
     await this.ensureSignedIn();
     const page = await this.page();
@@ -2247,6 +2302,9 @@ export class ChatGPTBrowser {
     }
     await this.click(trigger, "open-advanced-settings");
     await page.waitForTimeout(180);
+
+    const direct = await this.directAdvancedSettings();
+    if (direct) return direct;
 
     modelRow = await this.advancedRow(SELECTORS.modelRowLabels);
     thinkingRow = await this.advancedRow(SELECTORS.thinkingRowLabels);
@@ -2450,9 +2508,20 @@ export class ChatGPTBrowser {
   }
 
   async listThinkingLevels() {
-    const page = await this.page();
-    const { modelRow, thinkingRow } = await this.openAdvancedSettings();
+    const { modelRow, thinkingRow, layout, slider: directSlider } =
+      await this.openAdvancedSettings();
     const current = thinkingRow.value;
+    if (layout === "direct-picker") {
+      const slider = await this.answerTierSliderState(directSlider);
+      await this.closeAdvancedMenus();
+      return {
+        current,
+        levels: [],
+        control: { type: "slider", ...slider, current },
+        note:
+          "当前网页把思考强度直接显示为 Power 滑杆；返回其当前语义和值域。",
+      };
+    }
     await this.clickAdvancedRow(thinkingRow);
     const levels = await this.visibleMenuOptions({
       exclude: [modelRow.text, thinkingRow.text],
@@ -2540,10 +2609,72 @@ export class ChatGPTBrowser {
 
   async selectThinkingLevel(thinkingLevel) {
     const page = await this.page();
-    const { modelRow, thinkingRow } = await this.openAdvancedSettings();
+    const opened = await this.openAdvancedSettings();
+    const { modelRow, thinkingRow } = opened;
     if (normalize(thinkingRow.value) === normalize(thinkingLevel)) {
       await this.closeAdvancedMenus();
       return { requested: thinkingLevel, selected: thinkingRow.value, changed: false };
+    }
+    if (opened.layout === "direct-picker") {
+      const sliderState = await this.answerTierSliderState(opened.slider);
+      const min = Number(sliderState?.min);
+      const max = Number(sliderState?.max);
+      const original = Number(sliderState?.now);
+      if (
+        !Number.isFinite(min) ||
+        !Number.isFinite(max) ||
+        !Number.isFinite(original) ||
+        max < min ||
+        max - min > 20
+      ) {
+        await this.closeAdvancedMenus();
+        throw new ChatGPTWebError("思考强度滑块没有公开可安全遍历的范围。", {
+          requested: thinkingLevel,
+          slider: sliderState,
+        });
+      }
+
+      const available = [];
+      await opened.slider.focus();
+      await this.press(opened.slider, "Home", "thinking-slider-home");
+      for (let position = min; position <= max; position += 1) {
+        await page.waitForTimeout(100);
+        const observed = parseAnswerTier(
+          await opened.modelRow.locator.innerText().catch(() => ""),
+        );
+        if (observed) available.push(observed);
+        if (normalize(observed) === normalize(thinkingLevel)) {
+          await this.closeAdvancedMenus();
+          const selected = await this.answerTierControlLabel();
+          if (normalize(selected) !== normalize(thinkingLevel)) {
+            throw new ChatGPTWebError("思考强度切换后未通过页面校验。", {
+              requested: thinkingLevel,
+              observed: selected,
+            });
+          }
+          this.rememberSettings(modelRow.value, selected);
+          return {
+            requested: thinkingLevel,
+            selected,
+            changed: original !== position,
+            available,
+            verifiedBy: "power-slider-label",
+          };
+        }
+        if (position < max) {
+          await this.press(opened.slider, "ArrowRight", "thinking-slider-increment");
+        }
+      }
+
+      await this.press(opened.slider, "Home", "thinking-slider-restore-home");
+      for (let position = min; position < original; position += 1) {
+        await this.press(opened.slider, "ArrowRight", "thinking-slider-restore");
+      }
+      await this.closeAdvancedMenus();
+      throw new ChatGPTWebError("请求的思考强度不在当前 Power 滑杆中。", {
+        requested: thinkingLevel,
+        available,
+      });
     }
     await this.clickAdvancedRow(thinkingRow);
     const options = await this.visibleMenuOptions({
@@ -3001,8 +3132,15 @@ export class ChatGPTBrowser {
             const last = assistant.at(-1);
             const response = (last?.innerText || last?.textContent || "").trim();
             const stop = [...document.querySelectorAll(stopSelectors)].some(visible);
+            // Deep-research/web-search responses can expose a progress-only
+            // assistant node (for example "Planning …") without a stop
+            // button or the legacy streaming marker.  Treat its shimmer as
+            // active generation; otherwise waitForResponse returns before
+            // the final answer is attached to the same assistant node.
             const streaming = Boolean(
-              last?.querySelector("[data-is-streaming='true'], .result-streaming"),
+              last?.querySelector(
+                "[data-is-streaming='true'], .result-streaming, [class*='loading-shimmer'], [data-testid*='thinking']",
+              ),
             );
             return { count: assistant.length, response, stop, streaming, rateLimited };
           };
@@ -3544,14 +3682,21 @@ export class ChatGPTBrowser {
       : "";
     const streaming = lastAssistant
       ? await lastAssistant
-          .locator("[data-is-streaming='true'], .result-streaming")
+          .locator(
+            "[data-is-streaming='true'], .result-streaming, [class*='loading-shimmer'], [data-testid*='thinking']",
+          )
           .count()
           .then((value) => value > 0)
           .catch(() => false)
       : false;
+    // A completed response can occasionally leave an empty assistant
+    // placeholder in the DOM (for example after a streamed answer is
+    // finalized by the page).  Requiring non-empty text here leaves the
+    // runtime generation lock stuck forever even though the stop button and
+    // streaming marker are gone.  The assistant-node count/change is the
+    // authoritative completion signal; an empty node is still a new node.
     const generationComplete = Boolean(
       runtime.activeGeneration?.active &&
-        Boolean(lastAssistantText.trim()) &&
         !stop &&
         !streaming &&
         (runtime.activeGeneration.assistantBefore == null
