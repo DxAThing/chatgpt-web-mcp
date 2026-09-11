@@ -2635,15 +2635,18 @@ export class ChatGPTBrowser {
     if (action === "append") await this.type(composer, prompt, "append-prompt");
     else await this.fill(composer, prompt, "write-prompt");
 
-    const value = await this.composerText(composer);
-
-    if (!normalize(value).includes(normalize(prompt))) {
-      throw new ChatGPTWebError("提示词已写入，但输入框内容校验失败。", {
-        observedLength: value.length,
-        requestedLength: prompt.length,
-      });
-    }
-    return { written: true, characters: value.length, preview: value.slice(0, 300) };
+    // Do not validate the rendered composer text after writing. ChatGPT may
+    // normalize whitespace or insert capability pills (for example Web
+    // search), so a post-write text comparison can reject a successful write
+    // and leave the request in an ambiguous state. The pre-write draft guard
+    // above still protects user-owned text from accidental replacement.
+    const value = await this.composerText(composer).catch(() => "");
+    return {
+      written: true,
+      verificationSkipped: true,
+      characters: value.length,
+      preview: value.slice(0, 300),
+    };
   }
 
   async webSearchState() {
