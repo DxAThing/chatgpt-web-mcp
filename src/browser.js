@@ -2933,7 +2933,12 @@ export class ChatGPTBrowser {
         timeoutMs: effectiveTimeoutMs,
       });
       await updateRuntimeState({ activeGeneration: null, lastGenerationCompletedAt: Date.now() });
-      return result;
+      return {
+        ...result,
+        userMessageAppendVerified,
+        userMessageCountBefore: userBeforeSnapshot.count,
+        userMessageCountAfter: userAfterSnapshot.count,
+      };
     } catch (error) {
       if (this.signal()?.aborted) {
         await updateRuntimeState({
@@ -3123,9 +3128,6 @@ export class ChatGPTBrowser {
       waitMechanism: "mutation-observer",
       rateLimited: false,
       rateLimitScope: null,
-      userMessageAppendVerified,
-      userMessageCountBefore: userBeforeSnapshot.count,
-      userMessageCountAfter: userAfterSnapshot.count,
     };
   }
 
