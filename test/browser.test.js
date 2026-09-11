@@ -5,6 +5,7 @@ import {
   classifyNetworkModelSlug,
   classifyProbeModel,
   classifyRateLimitText,
+  composerEditReason,
   generationIsStale,
   interruptedGenerationFields,
   isProModel,
@@ -13,6 +14,7 @@ import {
   normalizeModelSlug,
   parseAdvancedRowValue,
   parseAnswerTier,
+  promptWriteAction,
   rankTextMatch,
   redactDiagnosticPath,
   siteActionDelayMs,
@@ -61,6 +63,19 @@ test("isProModel only enables unlimited waits for a Pro model token", () => {
 test("parseAnswerTier extracts the semantic tier from slider text", () => {
   assert.equal(parseAnswerTier("极高，第 4 项，共 5 项。 使用左右箭头键调整能力。"), "极高");
   assert.equal(parseAnswerTier("Pro, 5 of 5"), "Pro");
+});
+
+test("promptWriteAction never replaces a different user draft", () => {
+  assert.equal(promptWriteAction("", "new prompt"), "replace-empty");
+  assert.equal(promptWriteAction("new prompt", "new prompt"), "already-present");
+  assert.equal(promptWriteAction("user draft", "tool prompt"), "reject-nonempty");
+  assert.equal(promptWriteAction("user draft", "tool prompt", { append: true }), "append");
+});
+
+test("composerEditReason protects a user turn in edit mode", () => {
+  assert.equal(composerEditReason({ insideUserMessage: true }), "composer-inside-user-message");
+  assert.equal(composerEditReason({ visibleCancel: true }), "visible-edit-cancel-control");
+  assert.equal(composerEditReason(), null);
 });
 
 test("classifyProbeModel only accepts the two explicit routing identities", () => {

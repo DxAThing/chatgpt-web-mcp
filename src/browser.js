@@ -48,6 +48,27 @@ function normalize(value) {
     .toLocaleLowerCase();
 }
 
+/**
+ * Decide whether an automation request may write to the composer.
+ *
+ * A non-empty composer is user-owned state.  It must never be replaced by a
+ * tool retry or by a follow-up sent to the currently selected conversation.
+ */
+export function promptWriteAction(existingText, requestedText, { append = false } = {}) {
+  const existing = String(existingText || "");
+  const requested = String(requestedText || "");
+  if (append) return "append";
+  if (!normalize(existing)) return "replace-empty";
+  if (normalize(existing) === normalize(requested)) return "already-present";
+  return "reject-nonempty";
+}
+
+export function composerEditReason({ insideUserMessage = false, visibleCancel = false } = {}) {
+  if (insideUserMessage) return "composer-inside-user-message";
+  if (visibleCancel) return "visible-edit-cancel-control";
+  return null;
+}
+
 export function isProModel(value) {
   return /(^|[\s._-])pro($|[\s._-])/i.test(String(value || "").trim());
 }
@@ -1356,6 +1377,91 @@ export class ChatGPTBrowser {
     return null;
   }
 
+  async composerText(composer = null) {
+    const target = composer || (await this.composer());
+    if (!target) return "";
+    return target.evaluate((element) => {
+      if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+        return element.value;
+      }
+      // ProseMirror keeps capability pills (for example the selected Web
+      // search pill) inside the contenteditable.  They are UI state, not
+      // user-authored prompt text, and must not trip the draft guard.
+      const clone = element.cloneNode(true);
+      clone
+        .querySelectorAll(
+          "[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]",
+        )
+        .forEach((node) => node.remove());
+      return clone.innerText || clone.textContent || "";
+    });
+  }
+
+  async composerEditState(composer = null) {
+    const target = composer || (await this.composer());
+    if (!target) return { editing: false, reason: null };
+    const signals = await target.evaluate((element) => {
+      const userMessage = element.closest(
+        "[data-message-author-role='user'], article[data-turn='user'], section[data-turn='user']",
+      );
+      if (userMessage) {
+        return { insideUserMessage: true, visibleCancel: false };
+      }
+
+      // ChatGPT keeps the composer in the page root during ordinary sends,
+      // but moves it into the selected user turn when the pencil action is
+      // active.  The cancel control is a second signal for layouts that do
+      // not preserve the user-turn ancestor.
+      const scope = element.closest("form") || element.parentElement;
+      const visible = (node) => {
+        if (!(node instanceof HTMLElement)) return false;
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+      };
+      const cancel = [...(scope?.querySelectorAll("button") || [])].find((button) => {
+        if (!visible(button)) return false;
+        const label = `${button.getAttribute("aria-label") || ""} ${button.innerText || ""}`;
+        return /cancel\s+edit|取消编辑|cancel|取消/i.test(label) &&
+          !/stop|停止|close|关闭/i.test(label);
+      });
+      return { insideUserMessage: false, visibleCancel: Boolean(cancel) };
+    });
+    const reason = composerEditReason(signals);
+    return { editing: Boolean(reason), reason };
+  }
+
+  async assertComposerWritable(action, composer = null) {
+    const state = await this.composerEditState(composer);
+    if (!state.editing) return state;
+    throw new ChatGPTWebError(
+      "当前输入框处于用户消息编辑态，已拒绝写入或发送，避免覆盖原用户消息。",
+      {
+        action,
+        editState: state,
+        nextStep: "请先由用户取消编辑或完成人工编辑，再重试网页操作。",
+        overwritePrevented: true,
+      },
+    );
+  }
+
+  async assertComposerEmpty(action) {
+    const composer = await this.composer();
+    if (!composer) return;
+    await this.assertComposerWritable(action, composer);
+    const existing = await this.composerText(composer);
+    if (!normalize(existing)) return;
+    throw new ChatGPTWebError(
+      "输入框已有用户草稿，已拒绝切换或新建对话以避免覆盖。",
+      {
+        action,
+        existingCharacters: existing.length,
+        existingPreview: existing.slice(0, 160),
+        nextStep: "请先由用户手动处理当前草稿，再重试网页操作。",
+      },
+    );
+  }
+
   async signedIn() {
     if (Date.now() < this.#signedInUntil) return true;
     const page = await this.page();
@@ -1497,6 +1603,7 @@ export class ChatGPTBrowser {
       if (!blank) {
         const newChat = await this.firstVisible(SELECTORS.newChatLinks, { timeout: 1_500 });
         if (newChat) {
+          await this.assertComposerEmpty("new-chat");
           await this.siteAction("new-chat");
           // ChatGPT can animate two overlapping sidebar layers. A regular
           // Playwright click then waits on an inner SVG that intercepts the
@@ -1631,6 +1738,7 @@ export class ChatGPTBrowser {
 
     const button = await this.firstVisible(SELECTORS.temporaryChatButtons, { timeout: 1_500 });
     if (button) {
+      await this.assertComposerEmpty(enabled ? "enable-temporary-chat" : "disable-temporary-chat");
       await this.siteAction(enabled ? "enable-temporary-chat" : "disable-temporary-chat");
       await this.click(button, enabled ? "enable-temporary-chat-click" : "disable-temporary-chat-click");
       await page.waitForTimeout(500);
@@ -2499,16 +2607,35 @@ export class ChatGPTBrowser {
     await this.ensureSignedIn();
     const composer = await this.composer();
     if (!composer) throw new ChatGPTWebError("没有找到提示词输入框。");
+    await this.assertComposerWritable("write-prompt", composer);
 
-    if (append) await this.type(composer, prompt, "append-prompt");
+    const before = await this.composerText(composer);
+    const action = promptWriteAction(before, prompt, { append });
+    if (action === "reject-nonempty") {
+      throw new ChatGPTWebError(
+        "输入框已有用户草稿，已拒绝覆盖。请使用 append=true 或由用户先清空草稿。",
+        {
+          existingCharacters: before.length,
+          existingPreview: before.slice(0, 160),
+          requestedCharacters: prompt.length,
+          overwritePrevented: true,
+        },
+      );
+    }
+    if (action === "already-present") {
+      return {
+        written: false,
+        alreadyPresent: true,
+        protected: true,
+        characters: before.length,
+        preview: before.slice(0, 300),
+      };
+    }
+
+    if (action === "append") await this.type(composer, prompt, "append-prompt");
     else await this.fill(composer, prompt, "write-prompt");
 
-    const value = await composer.evaluate((element) => {
-      if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
-        return element.value;
-      }
-      return element.innerText || element.textContent || "";
-    });
+    const value = await this.composerText(composer);
 
     if (!normalize(value).includes(normalize(prompt))) {
       throw new ChatGPTWebError("提示词已写入，但输入框内容校验失败。", {
@@ -2694,23 +2821,37 @@ export class ChatGPTBrowser {
     return this.#page.locator(SELECTORS.userMessages.join(", "));
   }
 
+  async userMessageSnapshot() {
+    const users = this.userLocator();
+    const count = await users.count();
+    if (!count) return { count: 0, lastText: "", lastId: null };
+    const last = users.last();
+    const detail = await last.evaluate((element) => ({
+      text: element.innerText || element.textContent || "",
+      lastId:
+        element.getAttribute("data-message-id") ||
+        element.getAttribute("data-testid") ||
+        element.id ||
+        null,
+    }));
+    return { count, lastText: detail.text, lastId: detail.lastId };
+  }
+
   async submitPrompt({ wait = true, timeoutMs = RESPONSE_TIMEOUT_MS } = {}) {
     await this.ensureSignedIn();
     const page = await this.page();
     const composer = await this.composer();
     if (!composer) throw new ChatGPTWebError("没有找到提示词输入框。");
-    const promptText = await composer.evaluate((element) =>
-      element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement
-        ? element.value
-        : element.innerText || element.textContent || "",
-    );
+    await this.assertComposerWritable("submit-prompt", composer);
+    const promptText = await this.composerText(composer);
     if (!normalize(promptText)) throw new ChatGPTWebError("输入框为空，无法发送。");
 
     const assistantBefore = await this.assistantLocator().count();
     const assistantBeforeText = assistantBefore
       ? await this.assistantLocator().last().innerText().catch(() => "")
       : "";
-    const userBefore = await this.userLocator().count();
+    const userBeforeSnapshot = await this.userMessageSnapshot();
+    const userBefore = userBeforeSnapshot.count;
     await this.siteAction("send-prompt");
     const send = await this.firstVisible(SELECTORS.sendButton, { timeout: 1_000 });
     if (send && (await send.isEnabled().catch(() => true))) {
@@ -2742,12 +2883,43 @@ export class ChatGPTBrowser {
       { timeout: ACTION_TIMEOUT_MS },
     ).catch(() => {});
 
+    const userAfterSnapshot = await this.userMessageSnapshot();
+    const userMessageAppendVerified =
+      userAfterSnapshot.count > userBeforeSnapshot.count ||
+      (Boolean(userBeforeSnapshot.lastId) &&
+        Boolean(userAfterSnapshot.lastId) &&
+        userBeforeSnapshot.lastId !== userAfterSnapshot.lastId);
+    const sameTurn =
+      userBeforeSnapshot.count === userAfterSnapshot.count &&
+      userBeforeSnapshot.lastId &&
+      userBeforeSnapshot.lastId === userAfterSnapshot.lastId;
+    if (
+      sameTurn &&
+      normalize(userBeforeSnapshot.lastText) !== normalize(userAfterSnapshot.lastText) &&
+      normalize(userAfterSnapshot.lastText) === normalize(promptText)
+    ) {
+      throw new ChatGPTWebError(
+        "发送后未创建新的用户消息，检测到原用户消息内容被替换；已停止后续网页操作。",
+        {
+          overwriteDetected: true,
+          userMessageCount: userAfterSnapshot.count,
+          userMessageId: userAfterSnapshot.lastId,
+          previousCharacters: userBeforeSnapshot.lastText.length,
+          observedCharacters: userAfterSnapshot.lastText.length,
+          nextStep: "请人工恢复原消息后再继续；本工具不会自动重试或再次发送。",
+        },
+      );
+    }
+
     if (!wait) {
       return {
         sent: true,
         waiting: false,
         url: page.url(),
         conversationId: conversationIdFromUrl(page.url()),
+        userMessageAppendVerified,
+        userMessageCountBefore: userBeforeSnapshot.count,
+        userMessageCountAfter: userAfterSnapshot.count,
       };
     }
     const effectiveTimeoutMs =
@@ -2951,6 +3123,9 @@ export class ChatGPTBrowser {
       waitMechanism: "mutation-observer",
       rateLimited: false,
       rateLimitScope: null,
+      userMessageAppendVerified,
+      userMessageCountBefore: userBeforeSnapshot.count,
+      userMessageCountAfter: userAfterSnapshot.count,
     };
   }
 
@@ -3327,6 +3502,7 @@ export class ChatGPTBrowser {
       throw new ChatGPTWebError("请选择 conversationId、url 或 title 中的一项。");
     }
 
+    await this.assertComposerEmpty("select-history");
     await this.siteAction("select-history");
     await navigate(page, destination, { waitUntil: "domcontentloaded" }, this.signal());
     const composer = await this.composer();

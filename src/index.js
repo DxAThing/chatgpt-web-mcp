@@ -186,10 +186,10 @@ tool(
 
 tool(
   "chatgpt_write_prompt",
-  "把提示词准确写入 ChatGPT 网页输入框但不发送，适合先上传文件或让用户检查草稿。",
+  "把提示词准确写入 ChatGPT 网页输入框但不发送；为保护用户草稿，输入框非空时默认拒绝覆盖，需明确使用 append=true 追加。",
   {
     prompt: z.string().min(1),
-    append: z.boolean().default(false).describe("是否追加到已有草稿；默认覆盖。"),
+    append: z.boolean().default(false).describe("是否追加到已有草稿；默认保护并拒绝覆盖非空草稿。"),
   },
   ({ prompt, append }) => browser.writePrompt(prompt, { append }),
 );
@@ -222,7 +222,7 @@ tool(
 
 tool(
   "chatgpt_send_message",
-  `组合工具：可新建或继续对话、选择模式/模型/思考强度/能力档位、切换临时对话、上传文件、写入提示词、发送并取得回答。能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待；普通档位仍使用 timeoutMs。只有用户明确要求上传时才传 files。`,
+  `组合工具：可新建或继续对话、选择模式/模型/思考强度/能力档位、切换临时对话、上传文件、写入提示词、发送并取得回答。为保护用户草稿，发送前若输入框已有不同内容会拒绝写入，不会覆盖；新建/切换对话前也会保护非空草稿。能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待；普通档位仍使用 timeoutMs。只有用户明确要求上传时才传 files。`,
   {
     prompt: z.string().min(1),
     files: z.array(z.string().min(1)).default([]),
