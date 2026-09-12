@@ -410,6 +410,7 @@ test("refreshBeforeSend reloads the selected conversation before sending", async
   };
   browser.page = async () => page;
   browser.ensureSignedIn = async () => {};
+  browser.firstVisible = async () => null;
   browser.composer = async () => ({ });
   browser.assertComposerWritable = async () => {};
   browser.composerText = async () => "";
@@ -434,6 +435,7 @@ test("refreshBeforeSend restores a draft only when refresh cleared it", async ()
   };
   browser.page = async () => page;
   browser.ensureSignedIn = async () => {};
+  browser.firstVisible = async () => null;
   browser.composer = async () => ({ });
   browser.assertComposerWritable = async () => {};
   browser.composerText = async () => (readCount++ === 0 ? "draft" : "");
@@ -446,4 +448,26 @@ test("refreshBeforeSend restores a draft only when refresh cleared it", async ()
   const result = await browser.refreshBeforeSend({ reason: "test" });
   assert.equal(restored, "draft");
   assert.equal(result.draftRestored, true);
+});
+
+test("unarchiveConversationIfNeeded restores an archived thread before writes", async () => {
+  const browser = new ChatGPTBrowser();
+  const page = {
+    url: () => "https://chatgpt.com/c/conversation-a",
+    waitForTimeout: async () => {},
+  };
+  let clicks = 0;
+  let visibleChecks = 0;
+  browser.page = async () => page;
+  browser.firstVisible = async () => {
+    visibleChecks += 1;
+    return visibleChecks === 1 ? {} : null;
+  };
+  browser.domClick = async () => {
+    clicks += 1;
+  };
+
+  const result = await browser.unarchiveConversationIfNeeded();
+  assert.deepEqual(result, { unarchived: true, unarchiveVerified: true });
+  assert.equal(clicks, 1);
 });

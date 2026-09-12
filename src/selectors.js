@@ -55,6 +55,13 @@ export const SELECTORS = {
     "button:has-text('Add photos & files')",
     "button:has-text('添加照片和文件')",
   ],
+  unarchiveButtons: [
+    "button[data-testid='unarchive-button']",
+    "button[aria-label='Unarchive']",
+    "button[aria-label='取消归档']",
+    "button:has-text('Unarchive')",
+    "button:has-text('取消归档')",
+  ],
   modelButtons: [
     "button[data-testid='model-switcher-dropdown-button']",
     "button[aria-label*='Model selector']",

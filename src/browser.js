@@ -1398,6 +1398,38 @@ export class ChatGPTBrowser {
   }
 
   /**
+   * Archived conversations render their transcript without a composer.  The
+   * selected project conversation can still be continued, but only after the
+   * page's explicit Unarchive action restores the composer.  Do this lazily
+   * on write paths; read-only history/status calls must not mutate archive
+   * state.
+   */
+  async unarchiveConversationIfNeeded() {
+    const page = await this.page();
+    const button = await this.firstVisible(SELECTORS.unarchiveButtons, {
+      timeout: 500,
+    });
+    if (!button) return { unarchived: false };
+
+    await this.domClick(button, "unarchive-conversation");
+    await page.waitForTimeout(1_000);
+    const remaining = await this.firstVisible(SELECTORS.unarchiveButtons, {
+      timeout: 500,
+    });
+    // The clicked menu item can remain mounted briefly during the archive
+    // mutation.  The composer is the durable write-path signal; only fail if
+    // both the button and the missing composer persist after the transition.
+    const composer = remaining ? await this.composer() : null;
+    if (remaining && !composer) {
+      throw new ChatGPTWebError("取消归档后页面仍显示归档状态，已停止发送。", {
+        url: page.url(),
+        unarchiveVerified: false,
+      });
+    }
+    return { unarchived: true, unarchiveVerified: !remaining || Boolean(composer) };
+  }
+
+  /**
    * Reload the currently selected ChatGPT conversation immediately before a
    * tool-managed send.  The browser page is persistent across MCP calls, so a
    * stale React tree can otherwise keep an old user turn selected and a new
@@ -1412,6 +1444,7 @@ export class ChatGPTBrowser {
   async refreshBeforeSend({ reason = "send" } = {}) {
     const page = await this.page();
     await this.ensureSignedIn();
+    const unarchiveResult = await this.unarchiveConversationIfNeeded();
     const beforeUrl = page.url();
     const beforeParsed = new URL(beforeUrl);
     const beforeConversationId = conversationIdFromUrl(beforeUrl);
@@ -1500,6 +1533,7 @@ export class ChatGPTBrowser {
     }
     return {
       refreshed: true,
+      ...unarchiveResult,
       beforeUrl,
       afterUrl,
       conversationId: afterConversationId,
@@ -3411,6 +3445,11 @@ export class ChatGPTBrowser {
         { includeStatus: false },
       );
     } else {
+      // An archived historical thread has no composer or settings trigger.
+      // Restore it before applying optional settings so a requested
+      // thinkingLevel/high tier does not fail with a misleading missing
+      // control error.
+      await this.unarchiveConversationIfNeeded();
       if (mode) await this.selectMode(mode);
       if (model) await this.selectModel(model);
       if (thinkingLevel) await this.selectThinkingLevel(thinkingLevel);
