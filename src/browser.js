@@ -1397,6 +1397,117 @@ export class ChatGPTBrowser {
     });
   }
 
+  /**
+   * Reload the currently selected ChatGPT conversation immediately before a
+   * tool-managed send.  The browser page is persistent across MCP calls, so a
+   * stale React tree can otherwise keep an old user turn selected and a new
+   * prompt may replace that turn instead of appending a message.
+   *
+   * The caller must invoke this before uploading files or changing the
+   * composer.  A direct submit of an existing draft is also supported: the
+   * draft is captured, the page is reloaded, and the exact text is restored
+   * only when the refreshed composer is empty.  Any unexpected change is a
+   * hard error rather than an overwrite.
+   */
+  async refreshBeforeSend({ reason = "send" } = {}) {
+    const page = await this.page();
+    await this.ensureSignedIn();
+    const beforeUrl = page.url();
+    const beforeParsed = new URL(beforeUrl);
+    const beforeConversationId = conversationIdFromUrl(beforeUrl);
+    const beforeTemporary = beforeParsed.searchParams.get("temporary-chat") === "true";
+    const beforeComposer = await this.composer();
+    if (!beforeComposer) throw new ChatGPTWebError("刷新发送页面前没有找到提示词输入框。", { url: beforeUrl });
+    await this.assertComposerWritable(`refresh-before-${reason}`, beforeComposer);
+    const beforeDraft = await this.composerText(beforeComposer);
+    const beforeSearch = await this.webSearchState();
+    const pendingFiles = await page
+      .locator(SELECTORS.fileInput.join(", "))
+      .evaluateAll((inputs) =>
+        inputs.reduce((count, input) => count + Number(input.files?.length || 0), 0),
+      )
+      .catch(() => 0);
+
+    // File inputs are cleared by a full page reload.  Refuse to risk silently
+    // dropping an attachment; the atomic chatgpt_send_message path refreshes
+    // before upload and remains safe.
+    if (pendingFiles > 0) {
+      throw new ChatGPTWebError(
+        "发送前检测到尚未发送的附件；为避免刷新丢失附件，请使用 chatgpt_send_message 原子操作重试。",
+        { pendingFiles, url: beforeUrl, refreshRequired: true },
+      );
+    }
+
+    await this.pageInteraction("refresh-before-send");
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(500);
+    // Do not trust the pre-reload auth cache for the refreshed document.
+    this.#signedInUntil = 0;
+    await this.ensureSignedIn();
+
+    const afterUrl = page.url();
+    const afterParsed = new URL(afterUrl);
+    const afterConversationId = conversationIdFromUrl(afterUrl);
+    const afterTemporary = afterParsed.searchParams.get("temporary-chat") === "true";
+    if (
+      afterParsed.pathname !== beforeParsed.pathname ||
+      afterConversationId !== beforeConversationId ||
+      afterTemporary !== beforeTemporary
+    ) {
+      throw new ChatGPTWebError(
+        "发送前刷新改变了当前对话，已停止以避免把消息写入错误会话。",
+        {
+          beforeUrl,
+          afterUrl,
+          beforeConversationId,
+          afterConversationId,
+          beforeTemporary,
+          afterTemporary,
+          refreshRequired: true,
+        },
+      );
+    }
+
+    const afterComposer = await this.composer();
+    if (!afterComposer) {
+      throw new ChatGPTWebError("发送前刷新完成，但输入框未恢复。", {
+        url: afterUrl,
+        refreshRequired: true,
+      });
+    }
+    await this.assertComposerWritable(`refresh-after-${reason}`, afterComposer);
+    const afterDraft = await this.composerText(afterComposer);
+    if (normalize(beforeDraft) !== normalize(afterDraft)) {
+      if (!normalize(afterDraft) && normalize(beforeDraft)) {
+        await this.fill(afterComposer, beforeDraft, "restore-draft-after-refresh");
+      } else {
+        throw new ChatGPTWebError(
+          "发送前刷新后输入框内容发生变化，已拒绝继续以保护用户草稿。",
+          {
+            beforeCharacters: beforeDraft.length,
+            afterCharacters: afterDraft.length,
+            beforePreview: beforeDraft.slice(0, 160),
+            afterPreview: afterDraft.slice(0, 160),
+            overwritePrevented: true,
+            refreshRequired: true,
+          },
+        );
+      }
+    }
+
+    if (beforeSearch.selected && !(await this.webSearchState()).selected) {
+      await this.enableWebSearch();
+    }
+    return {
+      refreshed: true,
+      beforeUrl,
+      afterUrl,
+      conversationId: afterConversationId,
+      draftRestored: Boolean(normalize(beforeDraft) && !normalize(afterDraft)),
+      webSearchRestored: Boolean(beforeSearch.selected),
+    };
+  }
+
   async composerEditState(composer = null) {
     const target = composer || (await this.composer());
     if (!target) return { editing: false, reason: null };
@@ -2971,7 +3082,14 @@ export class ChatGPTBrowser {
     return { count, lastText: detail.text, lastId: detail.lastId };
   }
 
-  async submitPrompt({ wait = true, timeoutMs = RESPONSE_TIMEOUT_MS } = {}) {
+  async submitPrompt({
+    wait = true,
+    timeoutMs = RESPONSE_TIMEOUT_MS,
+    refresh = true,
+  } = {}) {
+    const refreshResult = refresh
+      ? await this.refreshBeforeSend({ reason: "submit-prompt" })
+      : null;
     await this.ensureSignedIn();
     const page = await this.page();
     const composer = await this.composer();
@@ -3054,6 +3172,7 @@ export class ChatGPTBrowser {
         userMessageAppendVerified,
         userMessageCountBefore: userBeforeSnapshot.count,
         userMessageCountAfter: userAfterSnapshot.count,
+        pageRefreshedBeforeSend: Boolean(refreshResult),
       };
     }
     const effectiveTimeoutMs =
@@ -3072,6 +3191,7 @@ export class ChatGPTBrowser {
         userMessageAppendVerified,
         userMessageCountBefore: userBeforeSnapshot.count,
         userMessageCountAfter: userAfterSnapshot.count,
+        pageRefreshedBeforeSend: Boolean(refreshResult),
       };
     } catch (error) {
       if (this.signal()?.aborted) {
@@ -3296,6 +3416,10 @@ export class ChatGPTBrowser {
       if (thinkingLevel) await this.selectThinkingLevel(thinkingLevel);
       if (answerTier) await this.selectAnswerTier(answerTier);
     }
+    // Refresh after conversation/settings changes and before any upload or
+    // composer mutation.  This prevents a stale page tree from targeting an
+    // existing user turn while keeping attachments intact.
+    const refreshResult = await this.refreshBeforeSend({ reason: "send-message" });
     if (files.length) await this.uploadFiles(files);
     await this.writePrompt(prompt);
     const search = webSearch ? await this.enableWebSearch() : { selected: false };
@@ -3303,8 +3427,16 @@ export class ChatGPTBrowser {
       isProModel(model) || isProTier(answerTier) || isProTier(this.#answerTier)
         ? null
         : timeoutMs;
-    const result = await this.submitPrompt({ wait, timeoutMs: effectiveTimeoutMs });
-    return { ...result, webSearch: search };
+    const result = await this.submitPrompt({
+      wait,
+      timeoutMs: effectiveTimeoutMs,
+      refresh: false,
+    });
+    return {
+      ...result,
+      webSearch: search,
+      pageRefreshedBeforeSend: refreshResult.refreshed,
+    };
   }
 
   async probeProIdentity({ mode, force = false } = {}) {
@@ -3343,9 +3475,10 @@ export class ChatGPTBrowser {
     // temporary chat at the currently available tier instead of failing early
     // while trying to select an unavailable UI option.
     await this.newChat({ temporary: true, mode }, { includeStatus: false });
+    const refreshResult = await this.refreshBeforeSend({ reason: "probe-pro-identity" });
     await this.writePrompt(PROBE_PROMPT);
     const captured = await this.captureConversationModelSlug(() =>
-      this.submitPrompt({ wait: true, timeoutMs: null }),
+      this.submitPrompt({ wait: true, timeoutMs: null, refresh: false }),
     );
     const result = captured.result;
     const modelSlug = captured.modelSlug;
@@ -3365,6 +3498,7 @@ export class ChatGPTBrowser {
       cached: false,
       rateLimited: result.rateLimited,
       rateLimitScope: result.rateLimitScope,
+      pageRefreshedBeforeSend: refreshResult.refreshed,
     };
     if (probe.classification !== "unknown") {
       const checkedAt = Date.now();
@@ -3416,16 +3550,21 @@ export class ChatGPTBrowser {
     if (!requestPro) {
       await this.newChat({ temporary: false, mode }, { includeStatus: false });
       const tier = await this.selectExtremeTier(DEFAULT_ANSWER_TIER);
+      const refreshResult = await this.refreshBeforeSend({ reason: "route-new-chat" });
       if (files.length) await this.uploadFiles(files);
       await this.writePrompt(prompt);
       const search = webSearch ? await this.enableWebSearch() : { selected: false };
-      const result = await this.submitPrompt({ wait, timeoutMs });
+      const result = await this.submitPrompt({ wait, timeoutMs, refresh: false });
       return {
         route: "default-extreme",
         probe: null,
         finalConversation: { tier: DEFAULT_ANSWER_TIER, temporary: false },
         tier,
-        result: { ...result, webSearch: search },
+        result: {
+          ...result,
+          webSearch: search,
+          pageRefreshedBeforeSend: refreshResult.refreshed,
+        },
       };
     }
 
@@ -3460,12 +3599,14 @@ export class ChatGPTBrowser {
       finalTier = await this.selectExtremeTier(DEFAULT_ANSWER_TIER);
       route = `fallback-${classification}-to-default`;
     }
+    const refreshResult = await this.refreshBeforeSend({ reason: "route-new-chat" });
     if (files.length) await this.uploadFiles(files);
     await this.writePrompt(prompt);
     const search = webSearch ? await this.enableWebSearch() : { selected: false };
     const result = await this.submitPrompt({
       wait,
       timeoutMs: classification === PROBE_ACCEPT_CLASSIFICATION ? null : timeoutMs,
+      refresh: false,
     });
     return {
       route,
@@ -3491,7 +3632,11 @@ export class ChatGPTBrowser {
         temporary: false,
       },
       tier: finalTier,
-      result: { ...result, webSearch: search },
+      result: {
+        ...result,
+        webSearch: search,
+        pageRefreshedBeforeSend: refreshResult.refreshed,
+      },
     };
   }
 

@@ -5,6 +5,7 @@ import {
   classifyNetworkModelSlug,
   classifyProbeModel,
   classifyRateLimitText,
+  ChatGPTBrowser,
   composerEditReason,
   generationIsStale,
   interruptedGenerationFields,
@@ -394,4 +395,55 @@ test("dead generation owners are stale but the current process is not", () => {
     false,
   );
   assert.equal(generationIsStale({ activeGeneration: { active: true } }), false);
+});
+
+test("refreshBeforeSend reloads the selected conversation before sending", async () => {
+  const browser = new ChatGPTBrowser();
+  let reloads = 0;
+  const page = {
+    url: () => "https://chatgpt.com/c/conversation-a",
+    reload: async () => {
+      reloads += 1;
+    },
+    waitForTimeout: async () => {},
+    locator: () => ({ evaluateAll: async () => 0 }),
+  };
+  browser.page = async () => page;
+  browser.ensureSignedIn = async () => {};
+  browser.composer = async () => ({ });
+  browser.assertComposerWritable = async () => {};
+  browser.composerText = async () => "";
+  browser.webSearchState = async () => ({ selected: false, label: null });
+  browser.pageInteraction = async () => {};
+
+  const result = await browser.refreshBeforeSend({ reason: "test" });
+  assert.equal(reloads, 1);
+  assert.equal(result.refreshed, true);
+  assert.equal(result.conversationId, "conversation-a");
+});
+
+test("refreshBeforeSend restores a draft only when refresh cleared it", async () => {
+  const browser = new ChatGPTBrowser();
+  let readCount = 0;
+  let restored = null;
+  const page = {
+    url: () => "https://chatgpt.com/c/conversation-a",
+    reload: async () => {},
+    waitForTimeout: async () => {},
+    locator: () => ({ evaluateAll: async () => 0 }),
+  };
+  browser.page = async () => page;
+  browser.ensureSignedIn = async () => {};
+  browser.composer = async () => ({ });
+  browser.assertComposerWritable = async () => {};
+  browser.composerText = async () => (readCount++ === 0 ? "draft" : "");
+  browser.webSearchState = async () => ({ selected: false, label: null });
+  browser.pageInteraction = async () => {};
+  browser.fill = async (_composer, value) => {
+    restored = value;
+  };
+
+  const result = await browser.refreshBeforeSend({ reason: "test" });
+  assert.equal(restored, "draft");
+  assert.equal(result.draftRestored, true);
 });
