@@ -4065,6 +4065,14 @@ export class ChatGPTBrowser {
       !(runtime.activeGeneration?.active && !generationComplete)
         ? await this.advancedSettings()
         : this.cachedSettings();
+    const conversationState = conversationTurnLimitState(
+      {
+        userMessageCount: userCount,
+        assistantMessageCount: count,
+        lengthLimitDetected: lengthLimit.limited,
+      },
+      MAX_CONVERSATION_TURNS,
+    );
     return {
       url: page.url(),
       conversationId: conversationIdFromUrl(page.url()),
@@ -4077,15 +4085,9 @@ export class ChatGPTBrowser {
         generationComplete || staleGeneration ? null : runtime.activeGeneration || null,
       rateLimited: rateLimit.limited,
       rateLimitScope: rateLimit.scope,
-      conversationTurnCount: conversationTurnLimitState(
-        {
-          userMessageCount: userCount,
-          assistantMessageCount: count,
-          lengthLimitDetected: lengthLimit.limited,
-        },
-        MAX_CONVERSATION_TURNS,
-      ).turnCount,
+      conversationTurnCount: conversationState.turnCount,
       maxConversationTurns: MAX_CONVERSATION_TURNS,
+      conversationRotationRequired: conversationState.shouldRotate,
       conversationLengthLimitDetected: lengthLimit.limited,
       circuitBreaker: rateLimit.limited
         ? (await readRuntimeState()).circuitBreaker || null
