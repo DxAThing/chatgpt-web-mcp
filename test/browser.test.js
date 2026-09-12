@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 
 import {
   classifyNetworkModelSlug,
+  classifyConversationLengthText,
   classifyProbeModel,
   classifyRateLimitText,
+  conversationTurnLimitState,
   ChatGPTBrowser,
   composerEditReason,
   generationIsStale,
@@ -148,6 +150,50 @@ test("classifyRateLimitText separates history and generation limits", () => {
     { limited: true, scope: "generation" },
   );
   assert.deepEqual(classifyRateLimitText("正常页面"), { limited: false, scope: null });
+});
+
+test("classifyConversationLengthText recognizes the ChatGPT cap banner", () => {
+  assert.deepEqual(
+    classifyConversationLengthText(
+      "You've reached the maximum length for this conversation, but you can keep talking by starting a new chat.",
+    ),
+    { limited: true, scope: "conversation-length" },
+  );
+  assert.deepEqual(
+    classifyConversationLengthText("此对话的长度上限已达到，请开始新对话。"),
+    { limited: true, scope: "conversation-length" },
+  );
+  assert.deepEqual(classifyConversationLengthText("正常回答"), {
+    limited: false,
+    scope: null,
+  });
+});
+
+test("conversationTurnLimitState rotates before the 41st turn", () => {
+  assert.equal(conversationTurnLimitState({ userMessageCount: 39, assistantMessageCount: 39 }).shouldRotate, false);
+  assert.equal(conversationTurnLimitState({ userMessageCount: 40, assistantMessageCount: 40 }).shouldRotate, true);
+  assert.equal(conversationTurnLimitState({ userMessageCount: 1, assistantMessageCount: 0 }).turnCount, 1);
+  assert.equal(conversationTurnLimitState({ userMessageCount: 0, assistantMessageCount: 0, lengthLimitDetected: true }).shouldRotate, true);
+});
+
+test("submitPrompt intercepts a capped conversation before touching the composer", async () => {
+  const browser = new ChatGPTBrowser();
+  const page = {
+    url: () => "https://chatgpt.com/c/capped",
+    locator: () => ({ innerText: async () => "You've reached the maximum length for this conversation." }),
+  };
+  browser.page = async () => page;
+  browser.ensureSignedIn = async () => {};
+  browser.userLocator = () => ({ count: async () => 40 });
+  browser.assistantLocator = () => ({ count: async () => 40 });
+  await assert.rejects(
+    () => browser.submitPrompt({ refresh: false }),
+    (error) => {
+      assert.equal(error.details.conversationRotationRequired, true);
+      assert.equal(error.details.conversationId, "capped");
+      return true;
+    },
+  );
 });
 
 test("siteActionDelayMs enforces the configured start interval", () => {

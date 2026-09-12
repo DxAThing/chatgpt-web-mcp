@@ -16,6 +16,7 @@
 - 浏览器和 ChatGPT 页面默认常驻，工具结束后只断开本地控制连接
 - 跨进程串行操作、低频节流、回答完成后的切换静默期
 - 遇到页面限流文字或 HTTP 429 时立即熔断，不自动关闭提示或重试
+- 对话达到 40 轮或出现 ChatGPT maximum-length banner 时，发送前自动归档可见 transcript 并轮换普通对话；直接 `chatgpt_submit_prompt` 会安全拦截
 - 只记录脱敏后的异常请求方法、路径、状态码和资源类型
 
 ## 运行要求
@@ -91,7 +92,7 @@ chatgpt-web-mcp help     显示帮助
 - 状态：`chatgpt_status`、`chatgpt_capabilities`、`chatgpt_browser_lifecycle`
 - 对话：`chatgpt_new_chat`、`chatgpt_set_temporary`、`chatgpt_list_history`、`chatgpt_search_history`、`chatgpt_select_history`
 - 设置：`chatgpt_list_modes`、`chatgpt_select_mode`、`chatgpt_list_models`、`chatgpt_select_model`、`chatgpt_list_thinking_levels`、`chatgpt_select_thinking_level`、`chatgpt_answer_tier_status`、`chatgpt_select_answer_tier`
-- 输入与输出：`chatgpt_write_prompt`、`chatgpt_upload_files`、`chatgpt_submit_prompt`、`chatgpt_send_message`、`chatgpt_get_latest_response`
+- 输入与输出：`chatgpt_write_prompt`、`chatgpt_upload_files`、`chatgpt_submit_prompt`、`chatgpt_send_message`、`chatgpt_get_latest_response`、`chatgpt_archive_conversation`
 - 安全：`chatgpt_circuit_breaker_status`、`chatgpt_clear_circuit_breaker`、`chatgpt_network_diagnostics`
 - 策略路由：`chatgpt_probe_pro_identity`、`chatgpt_route_new_chat`
 
@@ -154,6 +155,8 @@ chatgpt-web-mcp help     显示帮助
 - `CHATGPT_WEB_BROWSER_STATE`、`CHATGPT_WEB_RUNTIME_STATE`：本地状态文件
 - `CHATGPT_WEB_OPERATION_LOCK`：跨进程浏览器独占锁
 - `CHATGPT_WEB_NETWORK_LOG`：脱敏网络异常日志
+- `CHATGPT_WEB_MAX_CONVERSATION_TURNS`：发送前自动轮换阈值，默认 `40`
+- `CHATGPT_WEB_CONTEXT_ARCHIVE_DIR`：对话轮换前 Markdown 归档目录
 
 ## 隐私与局限
 
@@ -162,6 +165,7 @@ chatgpt-web-mcp help     显示帮助
 - 网络诊断不保存查询参数、Cookie、请求体、响应体或对话 ID。
 - 等待回答使用页面内的变更事件，不持续轮询页面。
 - 每次发送前只做一次当前对话整页刷新并重新校验；页面、对话 URL、用户草稿或附件状态异常时停止，不自动重试。
+- 对话轮换前的可见 transcript 由 `chatgpt_archive_conversation` 或原子发送路径以 `0600` Markdown 文件保存；归档目录应按部署需要纳入受控的研究文档路径。
 - ChatGPT 网页不是稳定 API；选择器可能随页面更新而需要维护。
 - 模型的自我说明只能作为路由信号，不等同于服务端可验证的模型证明。
 

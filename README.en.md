@@ -16,6 +16,7 @@ An unofficial local MCP server that lets Codex and other MCP clients operate `ch
 - Serialize browser control across MCP processes and apply conservative delays
 - Stop on rate-limit text or HTTP 429 without dismissing, retrying, or reloading
 - Route Pro requests through a configurable temporary identity probe and reuse a reliable result for the full lifetime of the same page session
+- Rotate conversations before the 40-turn cap, archiving the visible transcript first; direct submit calls are rejected at the cap
 - Store only sanitized network error metadata
 
 ## Requirements
@@ -94,6 +95,8 @@ These values can be changed without editing source code:
 | `CHATGPT_WEB_PROBE_ACCEPT_PATTERN` | GPT-5.6 Pro regular expression |
 | `CHATGPT_WEB_PROBE_FALLBACK_PATTERN` | GPT-5.5 mini regular expression |
 | `CHATGPT_WEB_PRO_RECHECK_AFTER_CLOSE_MS` | `10800000` (3 hours) |
+| `CHATGPT_WEB_MAX_CONVERSATION_TURNS` | `40` |
+| `CHATGPT_WEB_CONTEXT_ARCHIVE_DIR` | `~/.chatgpt-web-mcp/conversation-context` |
 
 See [.env.example](.env.example). The project does not automatically load `.env`; inject variables through the MCP client, shell, or operating system.
 
@@ -117,6 +120,7 @@ The server does not automatically clear the breaker, dismiss rate-limit messages
 - Response waiting uses in-page mutation events rather than page polling.
 - Failed in-page navigation stops instead of repeatedly reloading ChatGPT.
 - The ChatGPT web UI is not a stable API and selectors may require maintenance.
+- Before automatic conversation rotation, the visible transcript is written as a `0600` Markdown archive; use `chatgpt_archive_conversation` for explicit persistence.
 - A model's self-description is a routing signal, not cryptographic proof of the serving model.
 
 ## Development

@@ -179,4 +179,19 @@ export const NETWORK_LOG_FILE = path.resolve(
     path.join(os.homedir(), ".chatgpt-web-mcp", "network-diagnostics.jsonl"),
 );
 
+// ChatGPT currently caps the useful length of a single conversation.  Keep a
+// conservative limit below the server-side hard failure so tool-managed sends
+// rotate before the page displays “You've reached the maximum length ...”.
+export const MAX_CONVERSATION_TURNS = Number(
+  process.env.CHATGPT_WEB_MAX_CONVERSATION_TURNS || 40,
+);
+
+// Rotation archives are explicit user-requested persistence: the MCP keeps a
+// Markdown transcript before opening the next conversation.  Deployments may
+// point this at a checked-out research repository's docs directory.
+export const CONTEXT_ARCHIVE_DIR = path.resolve(
+  process.env.CHATGPT_WEB_CONTEXT_ARCHIVE_DIR ||
+    path.join(os.homedir(), ".chatgpt-web-mcp", "conversation-context"),
+);
+
 export const MAX_HISTORY_RESULTS = 50;

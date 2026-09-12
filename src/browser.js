@@ -11,10 +11,12 @@ import {
   CHATGPT_URL,
   CHROME_EXECUTABLE,
   CONVERSATION_CHANGE_INTERVAL_MS,
+  CONTEXT_ARCHIVE_DIR,
   DEFAULT_ANSWER_TIER,
   HEADLESS,
   HISTORY_QUIET_PERIOD_MS,
   MAX_HISTORY_RESULTS,
+  MAX_CONVERSATION_TURNS,
   BROWSER_STATE_FILE,
   NETWORK_LOG_FILE,
   OPERATION_LOCK_FILE,
@@ -167,6 +169,43 @@ export function classifyRateLimitText(text) {
     return { limited: true, scope: "generation" };
   }
   return { limited: true, scope: "unknown" };
+}
+
+/**
+ * Detect the page-level conversation length failure before another prompt is
+ * submitted.  ChatGPT has shipped both English and Chinese variants of this
+ * banner; matching the stable meaning keeps the guard independent of wording.
+ */
+export function classifyConversationLengthText(text) {
+  const body = normalize(text);
+  const limited =
+    /you(?:'|’)ve reached the maximum length for this conversation/.test(body) ||
+    /maximum length .*conversation.*start(?:ing)? a new chat/.test(body) ||
+    /对话(?:已)?达到(?:最大)?长度(?:上限)?|对话长度上限|此对话的长度上限/.test(body) ||
+    /conversation (?:is )?(?:too long|at maximum length)/.test(body);
+  return {
+    limited,
+    scope: limited ? "conversation-length" : null,
+  };
+}
+
+export function conversationTurnLimitState(
+  { userMessageCount = 0, assistantMessageCount = 0, lengthLimitDetected = false } = {},
+  limit = MAX_CONVERSATION_TURNS,
+) {
+  const users = Math.max(0, Number(userMessageCount) || 0);
+  const assistants = Math.max(0, Number(assistantMessageCount) || 0);
+  const turns = Math.max(users, assistants);
+  const threshold = Math.max(1, Number(limit) || MAX_CONVERSATION_TURNS);
+  return {
+    userMessageCount: users,
+    assistantMessageCount: assistants,
+    turnCount: turns,
+    limit: threshold,
+    limitReached: turns >= threshold,
+    lengthLimitDetected: Boolean(lengthLimitDetected),
+    shouldRotate: Boolean(lengthLimitDetected || turns >= threshold),
+  };
 }
 
 export function siteActionDelayMs(
@@ -1716,6 +1755,7 @@ export class ChatGPTBrowser {
     const signedIn = await this.signedIn();
     const settings =
       signedIn && includeSettings ? await this.advancedSettings() : this.cachedSettings();
+    const conversation = signedIn ? await this.conversationTurnStats() : null;
     return {
       browserRunning: true,
       signedIn,
@@ -1726,6 +1766,10 @@ export class ChatGPTBrowser {
       mode: signedIn ? await this.currentMode() : null,
       thinkingLevel: signedIn ? settings.thinkingLevel : null,
       temporary: signedIn ? await this.temporaryState() : null,
+      conversationTurns: conversation?.turnCount ?? null,
+      maxConversationTurns: MAX_CONVERSATION_TURNS,
+      conversationRotationRequired: conversation?.shouldRotate ?? false,
+      conversationLengthLimitDetected: conversation?.lengthLimitDetected ?? false,
       profile: USER_DATA_DIR,
     };
   }
@@ -3116,6 +3160,101 @@ export class ChatGPTBrowser {
     return { count, lastText: detail.text, lastId: detail.lastId };
   }
 
+  async conversationTurnStats() {
+    const page = await this.page();
+    const [userMessageCount, assistantMessageCount, body] = await Promise.all([
+      this.userLocator().count(),
+      this.assistantLocator().count(),
+      page.locator("body").innerText().catch(() => ""),
+    ]);
+    const lengthLimitDetected = classifyConversationLengthText(body).limited;
+    const state = conversationTurnLimitState(
+      { userMessageCount, assistantMessageCount, lengthLimitDetected },
+      MAX_CONVERSATION_TURNS,
+    );
+    return {
+      ...state,
+      conversationId: conversationIdFromUrl(page.url()),
+      url: page.url(),
+    };
+  }
+
+  async archiveConversation({ reason = "conversation-limit", stats = null } = {}) {
+    const page = await this.page();
+    const conversationId = conversationIdFromUrl(page.url()) || "unknown";
+    const users = await this.userLocator().allTextContents().catch(() => []);
+    const assistants = await this.assistantLocator().allTextContents().catch(() => []);
+    const turns = [];
+    const count = Math.max(users.length, assistants.length);
+    for (let index = 0; index < count; index += 1) {
+      if (users[index]?.trim()) turns.push(`## User ${index + 1}\n\n${users[index].trim()}`);
+      if (assistants[index]?.trim()) turns.push(`## Assistant ${index + 1}\n\n${assistants[index].trim()}`);
+    }
+    const now = new Date();
+    const stamp = now.toISOString().replace(/[:.]/g, "-");
+    const safeConversationId = conversationId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const fileName = `${stamp}_${safeConversationId}.md`;
+    const outputPath = path.join(CONTEXT_ARCHIVE_DIR, fileName);
+    const metadata = stats || await this.conversationTurnStats();
+    const content = [
+      "# ChatGPT conversation archive",
+      "",
+      `- archived_at: ${now.toISOString()}`,
+      `- conversation_id: ${conversationId}`,
+      `- source_url: ${page.url()}`,
+      `- reason: ${reason}`,
+      `- turn_count: ${metadata.turnCount}`,
+      `- user_message_count: ${metadata.userMessageCount}`,
+      `- assistant_message_count: ${metadata.assistantMessageCount}`,
+      "",
+      ...turns,
+      turns.length ? "" : "(No visible transcript was available.)",
+      "",
+    ].join("\n");
+    await fs.mkdir(CONTEXT_ARCHIVE_DIR, { recursive: true });
+    const temporaryPath = `${outputPath}.${process.pid}.tmp`;
+    await fs.writeFile(temporaryPath, content, { mode: 0o600 });
+    await fs.rename(temporaryPath, outputPath);
+    return {
+      archived: true,
+      archivePath: outputPath,
+      conversationId,
+      turnCount: metadata.turnCount,
+      userMessageCount: metadata.userMessageCount,
+      assistantMessageCount: metadata.assistantMessageCount,
+    };
+  }
+
+  async ensureConversationCapacity({ allowRotate = false } = {}) {
+    const stats = await this.conversationTurnStats();
+    if (!stats.shouldRotate) return { rotated: false, stats };
+    if (!allowRotate) {
+      throw new ChatGPTWebError(
+        "当前对话已达到自动轮换阈值，发送已拦截；请先新建对话。",
+        {
+          conversationRotationRequired: true,
+          maxConversationTurns: stats.limit,
+          ...stats,
+          nextStep: "调用 chatgpt_new_chat 或 chatgpt_route_new_chat 后重新发送。",
+        },
+      );
+    }
+    const archive = await this.archiveConversation({
+      reason: stats.lengthLimitDetected ? "page-length-limit" : "turn-limit",
+      stats,
+    });
+    const previousConversationId = stats.conversationId;
+    const root = await this.newChat({ temporary: false }, { includeStatus: false });
+    return {
+      rotated: true,
+      previousConversationId,
+      previousUrl: stats.url,
+      archive,
+      newConversation: root,
+      stats,
+    };
+  }
+
   async submitPrompt({
     wait = true,
     timeoutMs = RESPONSE_TIMEOUT_MS,
@@ -3126,6 +3265,10 @@ export class ChatGPTBrowser {
       : null;
     await this.ensureSignedIn();
     const page = await this.page();
+    // Direct write_prompt → submit_prompt callers must be stopped before a
+    // capped conversation can trigger the server-side banner.  Atomic
+    // sendMessage performs the safe archive-and-rotate path instead.
+    const capacity = await this.ensureConversationCapacity({ allowRotate: false });
     const composer = await this.composer();
     if (!composer) throw new ChatGPTWebError("没有找到提示词输入框。");
     await this.assertComposerWritable("submit-prompt", composer);
@@ -3408,6 +3551,19 @@ export class ChatGPTBrowser {
         url: page.url(),
       });
     }
+    const lengthLimit = classifyConversationLengthText(observed.response);
+    if (lengthLimit.limited) {
+      throw new ChatGPTWebError(
+        "ChatGPT 拒绝了本次发送：当前对话已达到长度上限。",
+        {
+          conversationRotationRequired: true,
+          maxConversationTurns: MAX_CONVERSATION_TURNS,
+          conversationId: conversationIdFromUrl(page.url()),
+          response: observed.response,
+          nextStep: "调用 chatgpt_new_chat 或 chatgpt_route_new_chat 后重新发送。",
+        },
+      );
+    }
     return {
       sent: true,
       completed: true,
@@ -3423,6 +3579,7 @@ export class ChatGPTBrowser {
       waitMechanism: "mutation-observer",
       rateLimited: false,
       rateLimitScope: null,
+      conversationCapacity: capacity,
     };
   }
 
@@ -3439,12 +3596,14 @@ export class ChatGPTBrowser {
     wait = true,
     timeoutMs = RESPONSE_TIMEOUT_MS,
   }) {
+    let rotation = null;
     if (newChat || temporary) {
       await this.newChat(
         { temporary, model, mode, thinkingLevel, answerTier },
         { includeStatus: false },
       );
     } else {
+      rotation = await this.ensureConversationCapacity({ allowRotate: true });
       // An archived historical thread has no composer or settings trigger.
       // Restore it before applying optional settings so a requested
       // thinkingLevel/high tier does not fail with a misleading missing
@@ -3475,6 +3634,7 @@ export class ChatGPTBrowser {
       ...result,
       webSearch: search,
       pageRefreshedBeforeSend: refreshResult.refreshed,
+      conversationRotation: rotation,
     };
   }
 
@@ -3853,6 +4013,7 @@ export class ChatGPTBrowser {
     const page = await this.page();
     const body = await page.locator("body").innerText().catch(() => "");
     const rateLimit = classifyRateLimitText(body);
+    const lengthLimit = classifyConversationLengthText(body);
     if (rateLimit.limited) await this.tripCircuitBreaker(rateLimit.scope, "page-text-read");
     const assistant = this.assistantLocator();
     const user = this.userLocator();
@@ -3916,6 +4077,16 @@ export class ChatGPTBrowser {
         generationComplete || staleGeneration ? null : runtime.activeGeneration || null,
       rateLimited: rateLimit.limited,
       rateLimitScope: rateLimit.scope,
+      conversationTurnCount: conversationTurnLimitState(
+        {
+          userMessageCount: userCount,
+          assistantMessageCount: count,
+          lengthLimitDetected: lengthLimit.limited,
+        },
+        MAX_CONVERSATION_TURNS,
+      ).turnCount,
+      maxConversationTurns: MAX_CONVERSATION_TURNS,
+      conversationLengthLimitDetected: lengthLimit.limited,
       circuitBreaker: rateLimit.limited
         ? (await readRuntimeState()).circuitBreaker || null
         : runtime.circuitBreaker || null,

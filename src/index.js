@@ -7,6 +7,8 @@ import { z } from "zod";
 import { ChatGPTBrowser } from "./browser.js";
 import {
   DEFAULT_ANSWER_TIER,
+  CONTEXT_ARCHIVE_DIR,
+  MAX_CONVERSATION_TURNS,
   PROBE_ACCEPT_CLASSIFICATION,
   PROBE_FALLBACK_CLASSIFICATION,
   PROBE_NETWORK_ACCEPT_CLASSIFICATION,
@@ -23,7 +25,7 @@ const server = new McpServer({
   version: "0.2.1",
 }, {
   instructions:
-    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。每次发送消息前必须刷新当前 ChatGPT 对话页面，并重新校验当前 URL、用户草稿和页面状态；原子发送路径必须在上传文件和写入提示词之前刷新，直接提交已有草稿时会安全恢复草稿，检测到变化则拒绝发送。新任务优先用 chatgpt_route_new_chat：普通请求使用当前可用档位“${DEFAULT_ANSWER_TIER}”；需要模型身份确认时发送网络身份探针，不选择或依赖当前不可用的 Pro 档位。身份以已完成的 /backend-api/f/conversation 响应中的 model_slug 为唯一权威：规范化后精确为 gpt-5-5-mini 才回退，任何其他非空 slug（例如 gpt-5-6-thinking）分类为“${PROBE_NETWORK_ACCEPT_CLASSIFICATION}”；页面自报文本不保留、不参与校验。页面或浏览器关闭后保留可靠结果 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。只有用户明确要求重新验证时才设置 forceProbe。`,
+    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。每次发送消息前必须刷新当前 ChatGPT 对话页面，并重新校验当前 URL、用户草稿和页面状态；原子发送路径必须在上传文件和写入提示词之前刷新，直接提交已有草稿时会安全恢复草稿，检测到变化则拒绝发送。对话达到 ${MAX_CONVERSATION_TURNS} 个用户/回答轮次或页面出现“maximum length”错误时，原子发送会先把可见 transcript 归档到 ${CONTEXT_ARCHIVE_DIR}，再自动新建普通对话；直接 submit_prompt 则拦截并返回轮换要求。新任务优先用 chatgpt_route_new_chat：普通请求使用当前可用档位“${DEFAULT_ANSWER_TIER}”；需要模型身份确认时发送网络身份探针，不选择或依赖当前不可用的 Pro 档位。身份以已完成的 /backend-api/f/conversation 响应中的 model_slug 为唯一权威：规范化后精确为 gpt-5-5-mini 才回退，任何其他非空 slug（例如 gpt-5-6-thinking）分类为“${PROBE_NETWORK_ACCEPT_CLASSIFICATION}”；页面自报文本不保留、不参与校验。页面或浏览器关闭后保留可靠结果 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。只有用户明确要求重新验证时才设置 forceProbe。`,
 });
 
 function asResult(value, isError = false) {
@@ -55,9 +57,9 @@ function tool(name, description, schema, handler, { allowDuringPause = false } =
   });
 }
 
-tool(
+  tool(
   "chatgpt_status",
-  "检查专用浏览器、登录、当前对话、模式与临时对话状态。仅在诊断或确需状态时调用；正常发送无需预先调用。默认不展开高级菜单。",
+  `检查专用浏览器、登录、当前对话、模式、临时对话和轮次状态（阈值 ${MAX_CONVERSATION_TURNS}）。仅在诊断或确需状态时调用；正常发送无需预先调用。默认不展开高级菜单。`,
   {
     includeSettings: z
       .boolean()
@@ -212,7 +214,7 @@ tool(
 
 tool(
   "chatgpt_submit_prompt",
-  `发送当前输入框中的提示词，并可等待 ChatGPT 网页回答完成。发送前会强制刷新当前对话并校验 URL、草稿和附件状态，避免旧页面状态覆盖用户消息。当前能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待，timeoutMs 仅用于普通档位。`,
+  `发送当前输入框中的提示词，并可等待 ChatGPT 网页回答完成。发送前会强制刷新当前对话、校验轮次上限（${MAX_CONVERSATION_TURNS}）以及 URL、草稿和附件状态；达到上限时直接拦截，避免触发网页 maximum-length 错误。当前能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待，timeoutMs 仅用于普通档位。`,
   {
     wait: z.boolean().default(true),
     timeoutMs: z.number().int().min(5_000).max(900_000).default(RESPONSE_TIMEOUT_MS),
@@ -222,7 +224,7 @@ tool(
 
 tool(
   "chatgpt_send_message",
-  `组合工具：可新建或继续对话、选择模式/模型/思考强度/能力档位、切换临时对话、上传文件、写入提示词、发送并取得回答。发送前会强制刷新当前对话，再校验 URL、草稿和页面状态；刷新发生在上传和写入之前，避免旧页面状态覆盖用户消息。为保护用户草稿，若输入框已有不同内容会拒绝写入，不会覆盖；新建/切换对话前也会保护非空草稿。能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待；普通档位仍使用 timeoutMs。只有用户明确要求上传时才传 files。`,
+  `组合工具：可新建或继续对话、选择模式/模型/思考强度/能力档位、切换临时对话、上传文件、写入提示词、发送并取得回答。继续已有对话时，发送前会强制刷新并检查 ${MAX_CONVERSATION_TURNS} 轮上限；达到上限或检测到网页 maximum-length 错误会先归档可见 transcript 到 ${CONTEXT_ARCHIVE_DIR}，再自动新建普通对话，结果返回 conversationRotation/archivePath。刷新发生在上传和写入之前，避免旧页面状态覆盖用户消息。为保护用户草稿，若输入框已有不同内容会拒绝写入，不会覆盖；新建/切换对话前也会保护非空草稿。能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待；普通档位仍使用 timeoutMs。只有用户明确要求上传时才传 files。`,
   {
     prompt: z.string().min(1),
     files: z.array(z.string().min(1)).default([]),
@@ -306,6 +308,16 @@ tool(
       .describe("是否额外读取模型和思考强度；默认 false。"),
   },
   ({ includeSettings }) => browser.getLatestResponse({ includeSettings }),
+  { allowDuringPause: true },
+);
+
+tool(
+  "chatgpt_archive_conversation",
+  `将当前对话可见 transcript 以 Markdown 原子写入 ${CONTEXT_ARCHIVE_DIR}，用于跨会话持久化上下文；不会发送消息或切换对话。`,
+  {
+    reason: z.string().min(1).default("manual-archive"),
+  },
+  ({ reason }) => browser.archiveConversation({ reason }),
   { allowDuringPause: true },
 );
 
