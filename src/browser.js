@@ -3361,6 +3361,7 @@ export class ChatGPTBrowser {
         assistantBefore,
         baselineResponse: assistantBeforeText,
         timeoutMs: effectiveTimeoutMs,
+        conversationCapacity: capacity,
       });
       await updateRuntimeState({ activeGeneration: null, lastGenerationCompletedAt: Date.now() });
       return {
@@ -3404,6 +3405,7 @@ export class ChatGPTBrowser {
     assistantBefore,
     baselineResponse = "",
     timeoutMs = RESPONSE_TIMEOUT_MS,
+    conversationCapacity = null,
   } = {}) {
     const page = await this.page();
     const signal = this.signal();
@@ -3579,7 +3581,7 @@ export class ChatGPTBrowser {
       waitMechanism: "mutation-observer",
       rateLimited: false,
       rateLimitScope: null,
-      conversationCapacity: capacity,
+      conversationCapacity,
     };
   }
 
