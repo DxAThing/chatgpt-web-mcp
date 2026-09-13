@@ -2952,7 +2952,11 @@ export class ChatGPTBrowser {
       };
     }
 
-    if (action === "append") await this.type(composer, prompt, "append-prompt");
+    // React's contenteditable composer can drop characters when a long
+    // append is sent through Playwright's per-keystroke `type()`.  Append is
+    // already explicitly authorized by the caller, so update the complete
+    // value atomically and preserve the exact existing draft.
+    if (action === "append") await this.fill(composer, `${before}${prompt}`, "append-prompt");
     else await this.fill(composer, prompt, "write-prompt");
 
     // Do not validate the rendered composer text after writing. ChatGPT may
