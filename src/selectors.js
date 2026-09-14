@@ -25,13 +25,16 @@ export const SELECTORS = {
   ],
   assistantMessages: [
     "[data-message-author-role='assistant']",
-    "article[data-turn='assistant']",
-    "section[data-turn='assistant']",
+    // New ChatGPT layouts render a section wrapper around the role node.
+    // Select the wrapper only when the role node is absent, otherwise one
+    // message would be counted twice.
+    "article[data-turn='assistant']:not(:has([data-message-author-role='assistant']))",
+    "section[data-turn='assistant']:not(:has([data-message-author-role='assistant']))",
   ],
   userMessages: [
     "[data-message-author-role='user']",
-    "article[data-turn='user']",
-    "section[data-turn='user']",
+    "article[data-turn='user']:not(:has([data-message-author-role='user']))",
+    "section[data-turn='user']:not(:has([data-message-author-role='user']))",
   ],
   fileInput: [
     "input[type='file']",

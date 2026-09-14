@@ -16,7 +16,7 @@ An unofficial local MCP server that lets Codex and other MCP clients operate `ch
 - Serialize browser control across MCP processes and apply conservative delays
 - Stop on rate-limit text or HTTP 429 without dismissing, retrying, or reloading
 - Route Pro requests through a configurable temporary identity probe and reuse a reliable result for the full lifetime of the same page session
-- Rotate conversations before the 40-turn cap, archiving the visible transcript first; direct submit calls are rejected at the cap
+- Rotate conversations before the 40-turn cap, loading older lazy history and archiving the complete transcript first; direct submit calls are rejected at the cap
 - Store only sanitized network error metadata
 
 ## Requirements
@@ -120,7 +120,7 @@ The server does not automatically clear the breaker, dismiss rate-limit messages
 - Response waiting uses in-page mutation events rather than page polling.
 - Failed in-page navigation stops instead of repeatedly reloading ChatGPT.
 - The ChatGPT web UI is not a stable API and selectors may require maintenance.
-- Before automatic conversation rotation, the visible transcript is written as a `0600` Markdown archive; use `chatgpt_archive_conversation` for explicit persistence.
+- Before automatic conversation rotation, the complete transcript (including older lazy-loaded messages) is written as a `0600` Markdown archive; use `chatgpt_archive_conversation` for explicit persistence.
 - A model's self-description is a routing signal, not cryptographic proof of the serving model.
 
 ## Development

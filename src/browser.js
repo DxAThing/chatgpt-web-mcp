@@ -1767,9 +1767,14 @@ export class ChatGPTBrowser {
       thinkingLevel: signedIn ? settings.thinkingLevel : null,
       temporary: signedIn ? await this.temporaryState() : null,
       conversationTurns: conversation?.turnCount ?? null,
+      userMessageCount: conversation?.userMessageCount ?? null,
+      assistantMessageCount: conversation?.assistantMessageCount ?? null,
       maxConversationTurns: MAX_CONVERSATION_TURNS,
       conversationRotationRequired: conversation?.shouldRotate ?? false,
       conversationLengthLimitDetected: conversation?.lengthLimitDetected ?? false,
+      transcriptMessageCount: conversation?.transcriptMessageCount ?? null,
+      transcriptLoaded: conversation?.transcriptLoaded ?? false,
+      transcriptLoadPasses: conversation?.transcriptLoadPasses ?? 0,
       profile: USER_DATA_DIR,
     };
   }
@@ -3140,6 +3145,194 @@ export class ChatGPTBrowser {
     };
   }
 
+  /**
+   * Return the message nodes that represent one message each.  New ChatGPT
+   * layouts put a role node inside a section wrapper; SELECTORS excludes such
+   * wrappers, so this remains compatible with older section-only layouts.
+   */
+  async renderedConversationMessages() {
+    const page = await this.page();
+    const selector = [
+      ...SELECTORS.userMessages,
+      ...SELECTORS.assistantMessages,
+    ].join(", ");
+    return page.locator(selector).evaluateAll((elements) =>
+      elements.map((element, index) => ({
+        index,
+        author:
+          element.getAttribute("data-message-author-role") ||
+          element.getAttribute("data-turn") ||
+          null,
+        id:
+          element.getAttribute("data-message-id") ||
+          element.getAttribute("data-testid") ||
+          element.id ||
+          null,
+        text: element.innerText || element.textContent || "",
+      })),
+    );
+  }
+
+  async transcriptScrollMetrics() {
+    const page = await this.page();
+    return page.evaluate(() => {
+      const anchor =
+        document.querySelector("[data-message-author-role]") ||
+        document.querySelector("section[data-turn], article[data-turn]");
+      let element = anchor;
+      while (element) {
+        const style = getComputedStyle(element);
+        if (
+          (style.overflowY === "auto" || style.overflowY === "scroll") &&
+          element.scrollHeight > element.clientHeight
+        ) {
+          return {
+            available: true,
+            top: element.scrollTop,
+            scrollHeight: element.scrollHeight,
+            clientHeight: element.clientHeight,
+          };
+        }
+        element = element.parentElement;
+      }
+      const fallback = document.scrollingElement;
+      return {
+        available: Boolean(fallback && fallback.scrollHeight > fallback.clientHeight),
+        top: fallback?.scrollTop || 0,
+        scrollHeight: fallback?.scrollHeight || 0,
+        clientHeight: fallback?.clientHeight || 0,
+      };
+    });
+  }
+
+  async scrollTranscriptToTop() {
+    const page = await this.page();
+    return page.evaluate(() => {
+      const anchor =
+        document.querySelector("[data-message-author-role]") ||
+        document.querySelector("section[data-turn], article[data-turn]");
+      let element = anchor;
+      while (element) {
+        const style = getComputedStyle(element);
+        if (
+          (style.overflowY === "auto" || style.overflowY === "scroll") &&
+          element.scrollHeight > element.clientHeight
+        ) {
+          element.scrollTop = 0;
+          element.dispatchEvent(new Event("scroll", { bubbles: true }));
+          return true;
+        }
+        element = element.parentElement;
+      }
+      if (document.scrollingElement) {
+        document.scrollingElement.scrollTop = 0;
+        window.scrollTo(0, 0);
+        return true;
+      }
+      return false;
+    });
+  }
+
+  async restoreTranscriptScroll(top) {
+    const page = await this.page();
+    await page.evaluate((desiredTop) => {
+      const anchor =
+        document.querySelector("[data-message-author-role]") ||
+        document.querySelector("section[data-turn], article[data-turn]");
+      let element = anchor;
+      while (element) {
+        const style = getComputedStyle(element);
+        if (
+          (style.overflowY === "auto" || style.overflowY === "scroll") &&
+          element.scrollHeight > element.clientHeight
+        ) {
+          element.scrollTop = Math.max(
+            0,
+            Math.min(Number(desiredTop) || 0, element.scrollHeight - element.clientHeight),
+          );
+          return;
+        }
+        element = element.parentElement;
+      }
+      window.scrollTo(0, Number(desiredTop) || 0);
+    }, top);
+  }
+
+  /**
+   * ChatGPT virtualizes long conversations and loads older turns when the
+   * transcript scroller reaches its top.  Count/archival code must therefore
+   * walk to the top and retain every message observed, instead of trusting
+   * the shallow DOM snapshot at the current viewport.
+   */
+  async loadCompleteTranscript({ maxPasses = 40, waitMs = 450, restoreScroll = true } = {}) {
+    const initial = await this.transcriptScrollMetrics();
+    const initialTop = initial.top;
+    const messagesByKey = new Map();
+    let orderedKeys = [];
+    let passes = 0;
+    let stablePasses = 0;
+    let complete = !initial.available;
+
+    const collect = async () => {
+      const entries = await this.renderedConversationMessages();
+      const currentKeys = [];
+      for (const entry of entries) {
+        if (entry.author !== "user" && entry.author !== "assistant") continue;
+        const text = String(entry.text || "");
+        const key = entry.id
+          ? `${entry.author}:id:${entry.id}`
+          : `${entry.author}:text:${normalize(text).slice(0, 2_000)}`;
+        currentKeys.push(key);
+        messagesByKey.set(key, {
+          author: entry.author,
+          id: entry.id,
+          text,
+        });
+      }
+      const currentSet = new Set(currentKeys);
+      orderedKeys = [
+        ...currentKeys,
+        ...orderedKeys.filter((key) => !currentSet.has(key)),
+      ];
+      return {
+        count: messagesByKey.size,
+        currentCount: currentKeys.length,
+      };
+    };
+
+    await collect();
+    const safePasses = Math.max(1, Math.min(Number(maxPasses) || 40, 120));
+    const safeWaitMs = Math.max(100, Math.min(Number(waitMs) || 450, 2_000));
+    while (!complete && passes < safePasses) {
+      const beforeCount = messagesByKey.size;
+      await this.scrollTranscriptToTop();
+      await (await this.page()).waitForTimeout(safeWaitMs);
+      passes += 1;
+      await collect();
+      const metrics = await this.transcriptScrollMetrics();
+      const added = messagesByKey.size > beforeCount;
+      if (added || metrics.top > 1) stablePasses = 0;
+      else stablePasses += 1;
+      if (!metrics.available || stablePasses >= 2) complete = true;
+    }
+
+    if (restoreScroll && initial.available) {
+      await this.restoreTranscriptScroll(initialTop);
+    }
+    const messages = orderedKeys
+      .map((key) => messagesByKey.get(key))
+      .filter(Boolean);
+    return {
+      messages,
+      messageCount: messages.length,
+      userMessageCount: messages.filter((message) => message.author === "user").length,
+      assistantMessageCount: messages.filter((message) => message.author === "assistant").length,
+      passes,
+      complete,
+      initialScrollTop: initialTop,
+    };
+  }
+
   assistantLocator() {
     return this.#page.locator(SELECTORS.assistantMessages.join(", "));
   }
@@ -3166,11 +3359,11 @@ export class ChatGPTBrowser {
 
   async conversationTurnStats() {
     const page = await this.page();
-    const [userMessageCount, assistantMessageCount, body] = await Promise.all([
-      this.userLocator().count(),
-      this.assistantLocator().count(),
+    const [transcript, body] = await Promise.all([
+      this.loadCompleteTranscript(),
       page.locator("body").innerText().catch(() => ""),
     ]);
+    const { userMessageCount, assistantMessageCount } = transcript;
     const lengthLimitDetected = classifyConversationLengthText(body).limited;
     const state = conversationTurnLimitState(
       { userMessageCount, assistantMessageCount, lengthLimitDetected },
@@ -3180,19 +3373,24 @@ export class ChatGPTBrowser {
       ...state,
       conversationId: conversationIdFromUrl(page.url()),
       url: page.url(),
+      transcriptMessageCount: transcript.messageCount,
+      transcriptLoaded: transcript.complete,
+      transcriptLoadPasses: transcript.passes,
     };
   }
 
   async archiveConversation({ reason = "conversation-limit", stats = null } = {}) {
     const page = await this.page();
     const conversationId = conversationIdFromUrl(page.url()) || "unknown";
-    const users = await this.userLocator().allTextContents().catch(() => []);
-    const assistants = await this.assistantLocator().allTextContents().catch(() => []);
+    const transcript = await this.loadCompleteTranscript({ restoreScroll: false });
     const turns = [];
-    const count = Math.max(users.length, assistants.length);
-    for (let index = 0; index < count; index += 1) {
-      if (users[index]?.trim()) turns.push(`## User ${index + 1}\n\n${users[index].trim()}`);
-      if (assistants[index]?.trim()) turns.push(`## Assistant ${index + 1}\n\n${assistants[index].trim()}`);
+    const roleCounts = { user: 0, assistant: 0 };
+    for (const message of transcript.messages) {
+      const text = message.text.trim();
+      if (!text || !(message.author in roleCounts)) continue;
+      roleCounts[message.author] += 1;
+      const label = message.author === "user" ? "User" : "Assistant";
+      turns.push(`## ${label} ${roleCounts[message.author]}\n\n${text}`);
     }
     const now = new Date();
     const stamp = now.toISOString().replace(/[:.]/g, "-");
@@ -3210,9 +3408,11 @@ export class ChatGPTBrowser {
       `- turn_count: ${metadata.turnCount}`,
       `- user_message_count: ${metadata.userMessageCount}`,
       `- assistant_message_count: ${metadata.assistantMessageCount}`,
+      `- transcript_message_count: ${transcript.messageCount}`,
+      `- transcript_load_passes: ${transcript.passes}`,
       "",
       ...turns,
-      turns.length ? "" : "(No visible transcript was available.)",
+      turns.length ? "" : "(No complete transcript was available.)",
       "",
     ].join("\n");
     await fs.mkdir(CONTEXT_ARCHIVE_DIR, { recursive: true });
@@ -3226,6 +3426,8 @@ export class ChatGPTBrowser {
       turnCount: metadata.turnCount,
       userMessageCount: metadata.userMessageCount,
       assistantMessageCount: metadata.assistantMessageCount,
+      transcriptMessageCount: transcript.messageCount,
+      transcriptLoadPasses: transcript.passes,
     };
   }
 
@@ -4023,11 +4225,11 @@ export class ChatGPTBrowser {
     if (rateLimit.limited) await this.tripCircuitBreaker(rateLimit.scope, "page-text-read");
     const assistant = this.assistantLocator();
     const user = this.userLocator();
-    const count = await assistant.count();
-    const userCount = await user.count();
+    const renderedAssistantCount = await assistant.count();
+    const renderedUserCount = await user.count();
     const runtime = await readRuntimeState();
     const stop = await this.firstVisible(SELECTORS.stopButton, { timeout: 100 });
-    const lastAssistant = count ? assistant.last() : null;
+    const lastAssistant = renderedAssistantCount ? assistant.last() : null;
     const lastAssistantText = lastAssistant
       ? await lastAssistant.innerText().catch(() => "")
       : "";
@@ -4051,8 +4253,8 @@ export class ChatGPTBrowser {
         !stop &&
         !streaming &&
         (runtime.activeGeneration.assistantBefore == null
-          ? count > 0
-          : count > Number(runtime.activeGeneration.assistantBefore) ||
+          ? renderedAssistantCount > 0
+          : renderedAssistantCount > Number(runtime.activeGeneration.assistantBefore) ||
             lastAssistantText.trim() !==
               String(runtime.activeGeneration.baselineResponse || "").trim()),
     );
@@ -4071,10 +4273,23 @@ export class ChatGPTBrowser {
       !(runtime.activeGeneration?.active && !generationComplete)
         ? await this.advancedSettings()
         : this.cachedSettings();
+    const transcript = stop || streaming ? null : await this.loadCompleteTranscript();
+    const userCount = transcript?.userMessageCount ?? renderedUserCount;
+    const assistantCount = transcript?.assistantMessageCount ?? renderedAssistantCount;
+    const latestUserText = transcript
+      ? transcript.messages.findLast((message) => message.author === "user")?.text.trim() || null
+      : renderedUserCount
+        ? (await user.last().innerText()).trim()
+        : null;
+    const latestAssistantText = transcript
+      ? transcript.messages.findLast((message) => message.author === "assistant")?.text.trim() || null
+      : renderedAssistantCount
+        ? lastAssistantText.trim()
+        : null;
     const conversationState = conversationTurnLimitState(
       {
         userMessageCount: userCount,
-        assistantMessageCount: count,
+        assistantMessageCount: assistantCount,
         lengthLimitDetected: lengthLimit.limited,
       },
       MAX_CONVERSATION_TURNS,
@@ -4082,10 +4297,10 @@ export class ChatGPTBrowser {
     return {
       url: page.url(),
       conversationId: conversationIdFromUrl(page.url()),
-      lastUserMessage: userCount ? (await user.last().innerText()).trim() : null,
+      lastUserMessage: latestUserText,
       userMessageCount: userCount,
-      response: count ? (await assistant.last().innerText()).trim() : null,
-      assistantMessageCount: count,
+      response: latestAssistantText,
+      assistantMessageCount: assistantCount,
       generating: Boolean(stop || streaming),
       activeGeneration:
         generationComplete || staleGeneration ? null : runtime.activeGeneration || null,
@@ -4095,6 +4310,9 @@ export class ChatGPTBrowser {
       maxConversationTurns: MAX_CONVERSATION_TURNS,
       conversationRotationRequired: conversationState.shouldRotate,
       conversationLengthLimitDetected: lengthLimit.limited,
+      transcriptMessageCount: transcript?.messageCount ?? null,
+      transcriptLoaded: transcript?.complete ?? false,
+      transcriptLoadPasses: transcript?.passes ?? 0,
       circuitBreaker: rateLimit.limited
         ? (await readRuntimeState()).circuitBreaker || null
         : runtime.circuitBreaker || null,

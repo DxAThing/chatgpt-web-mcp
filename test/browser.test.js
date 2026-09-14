@@ -25,6 +25,7 @@ import {
   validProbeCache,
 } from "../src/browser.js";
 import { chromeExecutableCandidates, PROBE_POLICY_KEY } from "../src/config.js";
+import { SELECTORS } from "../src/selectors.js";
 
 test("rankTextMatch prefers exact and unique model names", () => {
   const options = [
@@ -176,6 +177,69 @@ test("conversationTurnLimitState rotates before the 41st turn", () => {
   assert.equal(conversationTurnLimitState({ userMessageCount: 0, assistantMessageCount: 0, lengthLimitDetected: true }).shouldRotate, true);
 });
 
+test("message selectors count nested role nodes only once", () => {
+  assert.match(
+    SELECTORS.userMessages.join(", "),
+    /section\[data-turn='user'\]:not\(:has\(\[data-message-author-role='user'\]\)\)/,
+  );
+  assert.match(
+    SELECTORS.assistantMessages.join(", "),
+    /section\[data-turn='assistant'\]:not\(:has\(\[data-message-author-role='assistant'\]\)\)/,
+  );
+});
+
+test("loadCompleteTranscript walks lazy history and preserves chronological order", async () => {
+  const browser = new ChatGPTBrowser();
+  const snapshots = [
+    [
+      { author: "user", id: "u2", text: "new user" },
+      { author: "assistant", id: "a2", text: "new answer" },
+    ],
+    [
+      { author: "user", id: "u1", text: "old user" },
+      { author: "assistant", id: "a1", text: "old answer" },
+      { author: "user", id: "u2", text: "new user" },
+      { author: "assistant", id: "a2", text: "new answer" },
+    ],
+    [
+      { author: "user", id: "u1", text: "old user" },
+      { author: "assistant", id: "a1", text: "old answer" },
+      { author: "user", id: "u2", text: "new user" },
+      { author: "assistant", id: "a2", text: "new answer" },
+    ],
+    [
+      { author: "user", id: "u1", text: "old user" },
+      { author: "assistant", id: "a1", text: "old answer" },
+      { author: "user", id: "u2", text: "new user" },
+      { author: "assistant", id: "a2", text: "new answer" },
+    ],
+  ];
+  let metricCalls = 0;
+  let restoredTop = null;
+  browser.page = async () => ({ waitForTimeout: async () => {} });
+  browser.transcriptScrollMetrics = async () => {
+    metricCalls += 1;
+    return metricCalls === 1
+      ? { available: true, top: 240, scrollHeight: 1_000, clientHeight: 500 }
+      : { available: true, top: 0, scrollHeight: 1_000, clientHeight: 500 };
+  };
+  browser.renderedConversationMessages = async () => snapshots.shift() || [];
+  browser.scrollTranscriptToTop = async () => true;
+  browser.restoreTranscriptScroll = async (top) => {
+    restoredTop = top;
+  };
+
+  const result = await browser.loadCompleteTranscript({ maxPasses: 5, waitMs: 100 });
+  assert.equal(result.complete, true);
+  assert.equal(result.userMessageCount, 2);
+  assert.equal(result.assistantMessageCount, 2);
+  assert.deepEqual(
+    result.messages.map((message) => message.id),
+    ["u1", "a1", "u2", "a2"],
+  );
+  assert.equal(restoredTop, 240);
+});
+
 test("submitPrompt intercepts a capped conversation before touching the composer", async () => {
   const browser = new ChatGPTBrowser();
   const page = {
@@ -186,6 +250,13 @@ test("submitPrompt intercepts a capped conversation before touching the composer
   browser.ensureSignedIn = async () => {};
   browser.userLocator = () => ({ count: async () => 40 });
   browser.assistantLocator = () => ({ count: async () => 40 });
+  browser.loadCompleteTranscript = async () => ({
+    messageCount: 80,
+    userMessageCount: 40,
+    assistantMessageCount: 40,
+    passes: 0,
+    complete: true,
+  });
   await assert.rejects(
     () => browser.submitPrompt({ refresh: false }),
     (error) => {
