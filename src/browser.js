@@ -1216,18 +1216,13 @@ export class ChatGPTBrowser {
       if (!/^\/backend-api\//iu.test(pathname)) return;
       const headers = request.headers();
       if (!headers.authorization) return;
-      const keep = [
-        "authorization",
-        "chatgpt-account-id",
-        "oai-client-version",
-        "oai-device-id",
-        "oai-session-id",
-        "oai-language",
-        "x-oai-is-client-observation",
-        "x-oai-is-pending-updates",
-      ];
+      // Reuse the browser's complete request fingerprint.  ChatGPT's edge
+      // rejects a hand-built Node request even when the bearer token is valid.
+      // Cookie and body headers are supplied separately by the API reader.
       this.#apiHeaders = Object.fromEntries(
-        keep.filter((name) => headers[name]).map((name) => [name, headers[name]]),
+        Object.entries(headers).filter(
+          ([name]) => !["cookie", "content-length", "host"].includes(name),
+        ),
       );
     });
     page.on("response", (response) => {
@@ -1855,6 +1850,7 @@ export class ChatGPTBrowser {
       transcriptMessageCount: conversation?.transcriptMessageCount ?? null,
       transcriptLoaded: conversation?.transcriptLoaded ?? false,
       transcriptLoadPasses: conversation?.transcriptLoadPasses ?? 0,
+      transcriptSource: conversation?.transcriptSource ?? null,
       profile: USER_DATA_DIR,
     };
   }
@@ -3261,7 +3257,7 @@ export class ChatGPTBrowser {
     }
     const conversationId = conversationIdFromUrl(currentUrl);
     if (!conversationId) return { available: false, messages: [], error: "no-conversation-id" };
-    if (!this.#apiHeaders.authorization) {
+    const primeApiHeaders = async () => {
       const primePage = await this.#context.newPage().catch(() => null);
       if (primePage) {
         this.attachNetworkDiagnostics(primePage);
@@ -3274,24 +3270,30 @@ export class ChatGPTBrowser {
         await primePage.waitForTimeout(1_000).catch(() => {});
         await primePage.close().catch(() => {});
       }
-    }
+    };
+    if (!this.#apiHeaders.authorization) await primeApiHeaders();
     const cookieHeader = (await this.#context.cookies("https://chatgpt.com").catch(() => []))
       .map((cookie) => `${cookie.name}=${cookie.value}`)
       .join("; ");
     const endpoint = `${CHATGPT_URL.replace(/\/$/u, "")}/backend-api/conversations/${encodeURIComponent(conversationId)}?include_has_versions=true&num_turns=100`;
-    const response = await fetch(endpoint, {
-      headers: {
-        ...this.#apiHeaders,
-        accept: "application/json",
-        ...(cookieHeader ? { cookie: cookieHeader } : {}),
-        referer: currentUrl,
-        "x-openai-target-path": `/backend-api/conversations/${conversationId}`,
-        "x-openai-target-route": "/backend-api/conversations/{conversation_id}",
-      },
-    }).catch((error) => ({ ok: false, status: 0, error: String(error?.message || error) }));
-    const responseBody = response.ok
-      ? await response.json().catch(() => null)
-      : null;
+    const requestApi = () =>
+      fetch(endpoint, {
+        headers: {
+          ...this.#apiHeaders,
+          accept: "application/json",
+          ...(cookieHeader ? { cookie: cookieHeader } : {}),
+          referer: currentUrl,
+          "x-openai-target-path": `/backend-api/conversations/${conversationId}`,
+          "x-openai-target-route": "/backend-api/conversations/{conversation_id}",
+        },
+      }).catch((error) => ({ ok: false, status: 0, error: String(error?.message || error) }));
+    let response = await requestApi();
+    if ((response.status === 401 || response.status === 403) && this.#apiHeaders.authorization) {
+      this.#apiHeaders = {};
+      await primeApiHeaders();
+      response = await requestApi();
+    }
+    const responseBody = response.ok ? await response.json().catch(() => null) : null;
     if (!response.ok || !responseBody) {
       return {
         available: false,
@@ -4467,6 +4469,7 @@ export class ChatGPTBrowser {
       transcriptMessageCount: transcript?.messageCount ?? null,
       transcriptLoaded: transcript?.complete ?? false,
       transcriptLoadPasses: transcript?.passes ?? 0,
+      transcriptSource: transcript?.source || null,
       circuitBreaker: rateLimit.limited
         ? (await readRuntimeState()).circuitBreaker || null
         : runtime.circuitBreaker || null,
