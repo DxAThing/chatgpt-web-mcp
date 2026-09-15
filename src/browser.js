@@ -466,6 +466,57 @@ function conversationIdFromUrl(value) {
   return match?.[1] || null;
 }
 
+/**
+ * Parse the complete transcript returned by ChatGPT's conversation endpoint.
+ * The page virtualizes old turns, so the API mapping is the authoritative
+ * source for turn counting and archival whenever it is available.
+ */
+export function parseConversationApiTranscript(payload) {
+  const mapping = payload?.mapping;
+  if (!mapping || typeof mapping !== "object") return [];
+  const nodes = Array.isArray(mapping)
+    ? mapping.map((message, index) => ({ id: message?.id || `index-${index}`, message }))
+    : Object.entries(mapping).map(([id, node]) => ({ id, message: node?.message || node }));
+  const byId = new Map(nodes.map((node) => [node.id, node.message]));
+  const orderedMessages = [];
+  const seen = new Set();
+  let nodeId = payload?.current_node || null;
+  while (nodeId && !seen.has(nodeId)) {
+    seen.add(nodeId);
+    const message = byId.get(nodeId);
+    if (!message) break;
+    orderedMessages.unshift({ id: nodeId, message });
+    nodeId = mapping?.[nodeId]?.parent || null;
+  }
+  if (!orderedMessages.length) {
+    const fallback = nodes
+      .map((node, index) => ({ ...node, index }))
+      .sort((a, b) => {
+        const aTime = Number(a.message?.create_time);
+        const bTime = Number(b.message?.create_time);
+        if (Number.isFinite(aTime) && Number.isFinite(bTime) && aTime !== bTime) {
+          return aTime - bTime;
+        }
+        return a.index - b.index;
+      });
+    orderedMessages.push(...fallback);
+  }
+  return orderedMessages.flatMap(({ id, message }) => {
+    const author = message?.author?.role;
+    if (author !== "user" && author !== "assistant") return [];
+    const parts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
+    const text = parts
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part.text === "string") return part.text;
+        return "";
+      })
+      .join("");
+    if (!text.trim()) return [];
+    return [{ author, id: message?.id || id, text }];
+  });
+}
+
 function absoluteChatUrl(href) {
   return new URL(href, CHATGPT_URL).toString();
 }
@@ -3173,6 +3224,50 @@ export class ChatGPTBrowser {
     );
   }
 
+  async conversationApiTranscript() {
+    const page = await this.page();
+    const currentUrl = typeof page.url === "function" ? page.url() : "";
+    if (typeof page.evaluate !== "function") {
+      return { available: false, messages: [], error: "page-evaluate-unavailable" };
+    }
+    const conversationId = conversationIdFromUrl(currentUrl);
+    if (!conversationId) return { available: false, messages: [], error: "no-conversation-id" };
+    const response = await page
+      .evaluate(async (id) => {
+        try {
+          const result = await fetch(`/backend-api/conversation/${encodeURIComponent(id)}`, {
+            credentials: "include",
+            headers: { Accept: "application/json" },
+            cache: "no-store",
+          });
+          const body = await result.text();
+          let payload = null;
+          try {
+            payload = JSON.parse(body);
+          } catch {
+            // A challenge/login page is intentionally treated as unavailable.
+          }
+          return { ok: result.ok, status: result.status, payload };
+        } catch (error) {
+          return { ok: false, status: 0, error: String(error?.message || error) };
+        }
+      }, conversationId)
+      .catch((error) => ({ ok: false, status: 0, error: String(error?.message || error) }));
+    if (!response.ok || !response.payload) {
+      return {
+        available: false,
+        messages: [],
+        status: response.status || null,
+        error: response.error || `http-${response.status || "unknown"}`,
+      };
+    }
+    return {
+      available: true,
+      messages: parseConversationApiTranscript(response.payload),
+      status: response.status,
+    };
+  }
+
   async transcriptScrollMetrics() {
     const page = await this.page();
     return page.evaluate(() => {
@@ -3265,6 +3360,19 @@ export class ChatGPTBrowser {
    * the shallow DOM snapshot at the current viewport.
    */
   async loadCompleteTranscript({ maxPasses = 40, waitMs = 450, restoreScroll = true } = {}) {
+    const apiTranscript = await this.conversationApiTranscript();
+    if (apiTranscript.available) {
+      return {
+        messages: apiTranscript.messages,
+        messageCount: apiTranscript.messages.length,
+        userMessageCount: apiTranscript.messages.filter((message) => message.author === "user").length,
+        assistantMessageCount: apiTranscript.messages.filter((message) => message.author === "assistant").length,
+        passes: 0,
+        complete: true,
+        source: "conversation-api",
+        initialScrollTop: null,
+      };
+    }
     const initial = await this.transcriptScrollMetrics();
     const initialTop = initial.top;
     const messagesByKey = new Map();
@@ -3329,6 +3437,7 @@ export class ChatGPTBrowser {
       assistantMessageCount: messages.filter((message) => message.author === "assistant").length,
       passes,
       complete,
+      source: "dom-scroll",
       initialScrollTop: initialTop,
     };
   }
@@ -3376,6 +3485,7 @@ export class ChatGPTBrowser {
       transcriptMessageCount: transcript.messageCount,
       transcriptLoaded: transcript.complete,
       transcriptLoadPasses: transcript.passes,
+      transcriptSource: transcript.source || "unknown",
     };
   }
 
@@ -3410,6 +3520,7 @@ export class ChatGPTBrowser {
       `- assistant_message_count: ${metadata.assistantMessageCount}`,
       `- transcript_message_count: ${transcript.messageCount}`,
       `- transcript_load_passes: ${transcript.passes}`,
+      `- transcript_source: ${transcript.source || "unknown"}`,
       "",
       ...turns,
       turns.length ? "" : "(No complete transcript was available.)",

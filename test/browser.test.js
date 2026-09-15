@@ -17,6 +17,7 @@ import {
   normalizeModelSlug,
   parseAdvancedRowValue,
   parseAnswerTier,
+  parseConversationApiTranscript,
   promptWriteAction,
   rankTextMatch,
   redactDiagnosticPath,
@@ -67,6 +68,49 @@ test("isProModel only enables unlimited waits for a Pro model token", () => {
 test("parseAnswerTier extracts the semantic tier from slider text", () => {
   assert.equal(parseAnswerTier("极高，第 4 项，共 5 项。 使用左右箭头键调整能力。"), "极高");
   assert.equal(parseAnswerTier("Pro, 5 of 5"), "Pro");
+});
+
+test("parseConversationApiTranscript follows the active branch instead of shallow DOM", () => {
+  const transcript = parseConversationApiTranscript({
+    current_node: "a2",
+    mapping: {
+      root: { id: "root", parent: null, message: null },
+      u1: {
+        id: "u1",
+        parent: "root",
+        message: { id: "u1", author: { role: "user" }, content: { parts: ["old"] } },
+      },
+      a1: {
+        id: "a1",
+        parent: "u1",
+        message: { id: "a1", author: { role: "assistant" }, content: { parts: ["answer"] } },
+      },
+      u2: {
+        id: "u2",
+        parent: "a1",
+        message: { id: "u2", author: { role: "user" }, content: { parts: ["new"] } },
+      },
+      a2: {
+        id: "a2",
+        parent: "u2",
+        message: { id: "a2", author: { role: "assistant" }, content: { parts: ["latest"] } },
+      },
+      abandoned: {
+        id: "abandoned",
+        parent: "u1",
+        message: { id: "abandoned", author: { role: "assistant" }, content: { parts: ["branch"] } },
+      },
+    },
+  });
+  assert.deepEqual(
+    transcript.map((message) => [message.author, message.id, message.text]),
+    [
+      ["user", "u1", "old"],
+      ["assistant", "a1", "answer"],
+      ["user", "u2", "new"],
+      ["assistant", "a2", "latest"],
+    ],
+  );
 });
 
 test("promptWriteAction never replaces a different user draft", () => {
