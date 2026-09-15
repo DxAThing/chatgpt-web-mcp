@@ -4117,39 +4117,43 @@ export class ChatGPTBrowser {
     }
     await this.siteAction("open-history-search");
     await this.click(resolvedButton, "open-history-search-click");
+    try {
+      const input = await this.firstVisible(SELECTORS.historySearchInputs, { timeout: 2_000 });
+      if (!input) throw new ChatGPTWebError("搜索聊天窗口已打开，但没有找到搜索输入框。");
+      await this.siteAction("search-history");
+      await this.fill(input, query, "fill-history-search");
+      await page.waitForTimeout(800);
 
-    const input = await this.firstVisible(SELECTORS.historySearchInputs, { timeout: 2_000 });
-    if (!input) throw new ChatGPTWebError("搜索聊天窗口已打开，但没有找到搜索输入框。");
-    await this.siteAction("search-history");
-    await this.fill(input, query, "fill-history-search");
-    await page.waitForTimeout(800);
-
-    const links = page.locator(
-      "[role='dialog'] a[href^='/c/'], [role='dialog'] [data-href^='/c/'], a[href^='/c/']:visible",
-    );
-    const raw = await links.evaluateAll((elements) =>
-      elements.map((element) => ({
-        href: element.getAttribute("href") || element.getAttribute("data-href") || "",
-        title:
-          (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim() ||
-          element.getAttribute("title") ||
-          element.getAttribute("aria-label") ||
-          "",
-      })),
-    );
-    const conversations = uniqueBy(
-      raw
-        .filter((item) => /^\/c\//.test(item.href))
-        .map((item) => ({
-          id: conversationIdFromUrl(item.href),
-          title: item.title,
-          url: absoluteChatUrl(item.href),
+      const links = page.locator(
+        "[role='dialog'] a[href^='/c/'], [role='dialog'] [data-href^='/c/'], a[href^='/c/']:visible",
+      );
+      const raw = await links.evaluateAll((elements) =>
+        elements.map((element) => ({
+          href: element.getAttribute("href") || element.getAttribute("data-href") || "",
+          title:
+            (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim() ||
+            element.getAttribute("title") ||
+            element.getAttribute("aria-label") ||
+            "",
         })),
-      (item) => item.id,
-    ).slice(0, safeLimit);
+      );
+      const conversations = uniqueBy(
+        raw
+          .filter((item) => /^\/c\//.test(item.href))
+          .map((item) => ({
+            id: conversationIdFromUrl(item.href),
+            title: item.title,
+            url: absoluteChatUrl(item.href),
+          })),
+        (item) => item.id,
+      ).slice(0, safeLimit);
 
-    await this.keyboardPress(page, "Escape", "close-history-search").catch(() => {});
-    return { query, conversations, returned: conversations.length };
+      return { query, conversations, returned: conversations.length };
+    } finally {
+      // Also close the modal on selector/timeouts so later send/status calls
+      // cannot be blocked by a stale global-search dialog.
+      await this.keyboardPress(page, "Escape", "close-history-search").catch(() => {});
+    }
   }
 
   async selectHistory({ conversationId, url, title } = {}) {
