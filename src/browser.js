@@ -472,6 +472,23 @@ function conversationIdFromUrl(value) {
  * source for turn counting and archival whenever it is available.
  */
 export function parseConversationApiTranscript(payload) {
+  const parseMessage = (message, fallbackId = null) => {
+    const author = message?.author?.role;
+    if (author !== "user" && author !== "assistant") return null;
+    const parts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
+    const text = parts
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part.text === "string") return part.text;
+        return "";
+      })
+      .join("");
+    if (!text.trim()) return null;
+    return { author, id: message?.id || fallbackId, text };
+  };
+  if (Array.isArray(payload?.messages)) {
+    return payload.messages.map((message) => parseMessage(message)).filter(Boolean);
+  }
   const mapping = payload?.mapping;
   if (!mapping || typeof mapping !== "object") return [];
   const nodes = Array.isArray(mapping)
@@ -501,20 +518,7 @@ export function parseConversationApiTranscript(payload) {
       });
     orderedMessages.push(...fallback);
   }
-  return orderedMessages.flatMap(({ id, message }) => {
-    const author = message?.author?.role;
-    if (author !== "user" && author !== "assistant") return [];
-    const parts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
-    const text = parts
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (part && typeof part.text === "string") return part.text;
-        return "";
-      })
-      .join("");
-    if (!text.trim()) return [];
-    return [{ author, id: message?.id || id, text }];
-  });
+  return orderedMessages.map(({ id, message }) => parseMessage(message, id)).filter(Boolean);
 }
 
 function absoluteChatUrl(href) {
@@ -940,6 +944,7 @@ export class ChatGPTBrowser {
   #answerTier = null;
   #requestSignal = null;
   #networkLoggingPages = new WeakSet();
+  #apiHeaders = {};
 
   async captureConversationModelSlug(operation) {
     const page = await this.page();
@@ -1201,6 +1206,30 @@ export class ChatGPTBrowser {
   attachNetworkDiagnostics(page) {
     if (this.#networkLoggingPages.has(page)) return;
     this.#networkLoggingPages.add(page);
+    page.on("request", (request) => {
+      let pathname;
+      try {
+        pathname = new URL(request.url()).pathname;
+      } catch {
+        return;
+      }
+      if (!/^\/backend-api\//iu.test(pathname)) return;
+      const headers = request.headers();
+      if (!headers.authorization) return;
+      const keep = [
+        "authorization",
+        "chatgpt-account-id",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-session-id",
+        "oai-language",
+        "x-oai-is-client-observation",
+        "x-oai-is-pending-updates",
+      ];
+      this.#apiHeaders = Object.fromEntries(
+        keep.filter((name) => headers[name]).map((name) => [name, headers[name]]),
+      );
+    });
     page.on("response", (response) => {
       const status = response.status();
       if (status !== 403 && status !== 429 && status < 500) return;
@@ -3227,33 +3256,43 @@ export class ChatGPTBrowser {
   async conversationApiTranscript() {
     const page = await this.page();
     const currentUrl = typeof page.url === "function" ? page.url() : "";
-    if (typeof page.evaluate !== "function") {
+    if (!this.#context || typeof page.evaluate !== "function") {
       return { available: false, messages: [], error: "page-evaluate-unavailable" };
     }
     const conversationId = conversationIdFromUrl(currentUrl);
     if (!conversationId) return { available: false, messages: [], error: "no-conversation-id" };
-    const response = await page
-      .evaluate(async (id) => {
-        try {
-          const result = await fetch(`/backend-api/conversation/${encodeURIComponent(id)}`, {
-            credentials: "include",
-            headers: { Accept: "application/json" },
-            cache: "no-store",
-          });
-          const body = await result.text();
-          let payload = null;
-          try {
-            payload = JSON.parse(body);
-          } catch {
-            // A challenge/login page is intentionally treated as unavailable.
-          }
-          return { ok: result.ok, status: result.status, payload };
-        } catch (error) {
-          return { ok: false, status: 0, error: String(error?.message || error) };
-        }
-      }, conversationId)
-      .catch((error) => ({ ok: false, status: 0, error: String(error?.message || error) }));
-    if (!response.ok || !response.payload) {
+    if (!this.#apiHeaders.authorization) {
+      const primePage = await this.#context.newPage().catch(() => null);
+      if (primePage) {
+        this.attachNetworkDiagnostics(primePage);
+        await primePage
+          .goto(`${CHATGPT_URL.replace(/\/$/u, "")}/c/${conversationId}?mcp_api_prime=${Date.now()}`, {
+            waitUntil: "domcontentloaded",
+            timeout: ACTION_TIMEOUT_MS,
+          })
+          .catch(() => {});
+        await primePage.waitForTimeout(1_000).catch(() => {});
+        await primePage.close().catch(() => {});
+      }
+    }
+    const cookieHeader = (await this.#context.cookies("https://chatgpt.com").catch(() => []))
+      .map((cookie) => `${cookie.name}=${cookie.value}`)
+      .join("; ");
+    const endpoint = `${CHATGPT_URL.replace(/\/$/u, "")}/backend-api/conversations/${encodeURIComponent(conversationId)}?include_has_versions=true&num_turns=100`;
+    const response = await fetch(endpoint, {
+      headers: {
+        ...this.#apiHeaders,
+        accept: "application/json",
+        ...(cookieHeader ? { cookie: cookieHeader } : {}),
+        referer: currentUrl,
+        "x-openai-target-path": `/backend-api/conversations/${conversationId}`,
+        "x-openai-target-route": "/backend-api/conversations/{conversation_id}",
+      },
+    }).catch((error) => ({ ok: false, status: 0, error: String(error?.message || error) }));
+    const responseBody = response.ok
+      ? await response.json().catch(() => null)
+      : null;
+    if (!response.ok || !responseBody) {
       return {
         available: false,
         messages: [],
@@ -3263,7 +3302,7 @@ export class ChatGPTBrowser {
     }
     return {
       available: true,
-      messages: parseConversationApiTranscript(response.payload),
+      messages: parseConversationApiTranscript(responseBody),
       status: response.status,
     };
   }
