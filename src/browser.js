@@ -43,6 +43,12 @@ import {
 import { ChatGPTWebError } from "./errors.js";
 import { SELECTORS, TEXT } from "./selectors.js";
 
+// `:has-text()` is a Playwright-only selector and cannot be passed to
+// document.querySelectorAll() inside page.evaluate(). Filter stale thinking
+// wrappers in JavaScript instead, using an anchored match so a real answer
+// mentioning the word "thinking" is not discarded.
+const THINKING_WRAPPER_RE = /^\s*(?:thinking|思考)(?:\s*(?:[.…:：]|$))/iu;
+
 function normalize(value) {
   return String(value || "")
     .replace(/\s+/g, " ")
@@ -1884,7 +1890,11 @@ export class ChatGPTBrowser {
               ({ userSelectors, assistantSelectors }) =>
                 location.pathname === "/" &&
                 document.querySelectorAll(userSelectors).length === 0 &&
-                document.querySelectorAll(assistantSelectors).length === 0,
+                [...document.querySelectorAll(assistantSelectors)].filter(
+                  (element) => !/^\s*(?:thinking|思考)(?:\s*(?:[.…:：]|$))/iu.test(
+                    element.innerText || element.textContent || "",
+                  ),
+                ).length === 0,
               {
                 userSelectors: SELECTORS.userMessages.join(", "),
                 assistantSelectors: SELECTORS.assistantMessages.join(", "),
@@ -3484,7 +3494,9 @@ export class ChatGPTBrowser {
   }
 
   assistantLocator() {
-    return this.#page.locator(SELECTORS.assistantMessages.join(", "));
+    return this.#page
+      .locator(SELECTORS.assistantMessages.join(", "))
+      .filter({ hasNotText: THINKING_WRAPPER_RE });
   }
 
   userLocator() {
@@ -3785,7 +3797,12 @@ export class ChatGPTBrowser {
             const rateLimited =
               /请求过于频繁|too many requests|request.*too frequent/i.test(body) &&
               /稍等|分钟|try again|wait/i.test(body);
-            const assistant = [...document.querySelectorAll(assistantSelectors)];
+            const assistant = [...document.querySelectorAll(assistantSelectors)].filter(
+              (element) =>
+                !/^\s*(?:thinking|思考)(?:\s*(?:[.…:：]|$))/iu.test(
+                  element.innerText || element.textContent || "",
+                ),
+            );
             const last = assistant.at(-1);
             const response = (last?.innerText || last?.textContent || "").trim();
             const stop = [...document.querySelectorAll(stopSelectors)].some(visible);
