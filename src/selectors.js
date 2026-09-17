@@ -28,9 +28,11 @@ export const SELECTORS = {
     "[data-message-author-role='assistant']",
     // New ChatGPT layouts render a section wrapper around the role node.
     // Select the wrapper only when the role node is absent, otherwise one
-    // message would be counted twice.
-    "article[data-turn='assistant']:not(:has([data-message-author-role='assistant']))",
-    "section[data-turn='assistant']:not(:has([data-message-author-role='assistant']))",
+    // message would be counted twice.  Thinking/reasoning wrappers are not
+    // assistant answers; including them makes a completed answer look like
+    // an active generation forever when the shimmer node is left in the DOM.
+    "article[data-turn='assistant']:not(:has([data-message-author-role='assistant'])):not(:has-text('Thinking')):not(:has-text('思考'))",
+    "section[data-turn='assistant']:not(:has([data-message-author-role='assistant'])):not(:has-text('Thinking')):not(:has-text('思考'))",
   ],
   userMessages: [
     "[data-message-author-role='user']",

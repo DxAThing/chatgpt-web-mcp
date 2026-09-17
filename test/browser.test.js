@@ -230,6 +230,10 @@ test("message selectors count nested role nodes only once", () => {
     SELECTORS.assistantMessages.join(", "),
     /section\[data-turn='assistant'\]:not\(:has\(\[data-message-author-role='assistant'\]\)\)/,
   );
+  assert.match(
+    SELECTORS.assistantMessages.join(", "),
+    /not\(:has-text\('Thinking'\)\):not\(:has-text\('思考'\)\)/,
+  );
 });
 
 test("loadCompleteTranscript walks lazy history and preserves chronological order", async () => {
